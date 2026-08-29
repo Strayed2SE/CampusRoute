@@ -1,0 +1,1 @@
+# Optional GeoSite domain metadata; CIDR sets are used by the data plane.

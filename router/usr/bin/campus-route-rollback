@@ -1,0 +1,27 @@
+#!/bin/sh
+# Restore the saved Campus Route UCI configuration.  The service teardown is
+# deliberately used instead of iptables-restore so unrelated OpenClash,
+# Passwall, and firewall3 rules remain untouched.
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+DRY=0
+SNAP=
+case "$1" in --dry-run) DRY=1; SNAP="$2" ;; --help|-h) printf '%s\n' "Usage: $0 [--dry-run] SNAPSHOT_DIR"; exit 0 ;; *) SNAP="$1" ;; esac
+[ -n "$SNAP" ] && [ -d "$SNAP" ] || { printf '%s\n' 'snapshot directory is required' >&2; exit 2; }
+[ -f "$SNAP/manifest" ] || { printf '%s\n' 'manifest missing' >&2; exit 1; }
+[ -f "$SNAP/campus_route.uci" ] || { printf '%s\n' 'campus_route.uci missing' >&2; exit 1; }
+ENABLED="$(awk '$1 ~ /^option enabled/ {gsub(/[\047]/,"",$3); print $3; exit}' "$SNAP/campus_route.uci" 2>/dev/null)"
+if [ "$DRY" -eq 1 ]; then
+	printf '%s\n' "would stop campus-route, restore /etc/config/campus_route from $SNAP/campus_route.uci, reload firewall, and start only if enabled=$ENABLED"
+	exit 0
+fi
+[ "$(id -u 2>/dev/null)" = 0 ] || { printf '%s\n' 'root is required' >&2; exit 1; }
+STAMP="$(date -u '+%Y%m%dT%H%M%SZ' 2>/dev/null || date '+%Y%m%d%H%M%S')"
+mkdir -p /etc/campus-route/rollback-before 2>/dev/null
+[ -f /etc/config/campus_route ] && cp -p /etc/config/campus_route "/etc/campus-route/rollback-before/campus_route.$STAMP.uci"
+/etc/init.d/campus-route stop >/dev/null 2>&1 || /usr/bin/campus-route stop >/dev/null 2>&1
+cp -p "$SNAP/campus_route.uci" /etc/config/campus_route || exit 1
+uci -q commit campus_route 2>/dev/null || true
+/etc/init.d/firewall reload >/dev/null 2>&1 || true
+case "$ENABLED" in 1|yes|true|on) /etc/init.d/campus-route start >/dev/null 2>&1 ;; *) /etc/init.d/campus-route stop >/dev/null 2>&1 ;; esac
+printf '%s\n' 'Campus Route rollback completed; unrelated firewall/plugin state was preserved.'

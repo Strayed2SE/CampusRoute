@@ -1,0 +1,3 @@
+9401699cc12480005b4c3877feae23bb28cce0686b3c1e541be0da885bb248c9  CampusRoute-public-source-v1.zip
+4a9c4d2dc05609eb1867f2d5feb1007979aa2fb2961db73df4fe075e05081f51  CampusRoute-router-public-v1.tar.gz
+f9e56508dadeb80ddefe7e8b43680901c4c2ffc1ae1e2d35ea2e0f2340601518  CampusRoute-Windows-x64-public-v1.zip

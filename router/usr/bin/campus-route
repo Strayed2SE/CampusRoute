@@ -1,0 +1,985 @@
+#!/bin/sh
+# Campus Route policy router for QWRT/OpenWrt 21.02.
+# The script is intentionally idempotent: reconcile can be called after every
+# network/firewall/plugin event without duplicating rules.
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+CONFIG=campus_route
+STATE_DIR=/var/run/campus-route
+STATE_FILE="$STATE_DIR/state"
+HEALTH_FILE="$STATE_DIR/campus-health"
+DATA_SIG_FILE="$STATE_DIR/dataplane.signature"
+POLICY_SIG_FILE="$STATE_DIR/policy.signature"
+STATS_FILE="$STATE_DIR/reconcile.stats"
+GEOSITE_RETRY_FILE="$STATE_DIR/geosite.retry"
+RULE_DIR=/etc/campus-route/rules
+DNSMASQ_CONF=/tmp/dnsmasq.d/campus-route.conf
+LOGTAG=campus-route
+LOCK_DIR="$STATE_DIR/lock"
+MANGLE_CHAIN=CAMPUS_ROUTE_MANGLE
+FILTER_CHAIN=CAMPUS_ROUTE_FILTER
+SET4=campus_cn4
+SET6=campus_cn6
+GEO4=campus_geosite4
+GEO6=campus_geosite6
+MARK_CAMPUS=0x1000
+MARK_USB=0x2000
+MARK_BLOCK=0x3000
+PREF_CAMPUS=10010
+PREF_USB=10020
+PREF_BLOCK=10030
+MASK=0xf000
+IPT4=iptables-legacy
+IPT6=ip6tables-legacy
+ENABLED=0
+IPV6=1
+USB_ONLINE=0
+USB_ONLINE4=0
+USB_ONLINE6=0
+USB_DEV=
+USB_LOGICAL=
+CAMPUS_ONLINE=0
+CAMPUS_ONLINE_REASON=missing
+CAMPUS_HEALTH_STATE=unknown
+CAMPUS_HEALTH_FAILURES=0
+CAMPUS_HEALTH_SUCCESSES=0
+CAMPUS_LINK_UP=0
+CAMPUS_SRC4=
+CAMPUS_SRC6=
+CAMPUS_UNAVAILABLE_ACTION=usb
+FORCE_RECLASSIFY=0
+CAMPUS_IFINDEX=
+USB_IFINDEX=
+CAMPUS_DEV=
+CAMPUS_GW=
+CAMPUS_GW6=
+CAMPUS_LAN_DEV=
+USB_GW=
+USB_GW6=
+USB_ONLINE_REASON=missing
+GEO_DOMAINS=0
+CAMPUS_TABLE=
+USB_TABLE=
+BLOCK_TABLE=
+DATA_PLANE_SIGNATURE=
+POLICY_SIGNATURE=
+LAST_RECONCILE_ACTION=none
+
+mkdir -p "$STATE_DIR" /etc/campus-route "$RULE_DIR" 2>/dev/null
+
+cfg() {
+	uci -q get "$CONFIG.main.$1" 2>/dev/null
+}
+
+cfg_bool() {
+	local v
+	v="$(cfg "$1")"
+	case "$v" in 1|yes|true|on|enabled) printf '1' ;; *) printf '0' ;; esac
+}
+
+list_csv() {
+	local key="$1" value
+	# UCI list options are read from uci show so all entries are retained.
+	# uci show prints list values as: 'one' 'two'. Strip quoting before
+	# converting whitespace to commas; retaining apostrophes breaks multiport,
+	# probe-host, and encrypted-port rules on BusyBox ash.
+	value="$(uci -q show "$CONFIG.main" 2>/dev/null | sed -n "s#^campus_route\\.main\\.$key=##p" | tr -d "'\\\"" | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g; s/^ *//; s/ *$//; s/ /,/g')"
+	[ -n "$value" ] || value="$(cfg "$1" | tr -d "'\\\"" | tr ' ' ',')"
+	printf '%s\n' "$value"
+}
+
+log_msg() {
+	logger -t "$LOGTAG" "$*" 2>/dev/null
+}
+
+set_error() {
+	local msg="$*"
+	printf '%s\n' "$msg" > "$STATE_DIR/last_error"
+	log_msg "$msg"
+}
+
+clear_error() { rm -f "$STATE_DIR/last_error"; }
+
+load_config() {
+	ENABLED="$(cfg_bool enabled)"
+	CAMPUS_IFACE="$(cfg campus_iface)"; [ -n "$CAMPUS_IFACE" ] || CAMPUS_IFACE=wan
+	USB_IFACE_PRIMARY="$(cfg usb_iface_primary)"; [ -n "$USB_IFACE_PRIMARY" ] || USB_IFACE_PRIMARY=wanusb
+	USB_IFACE_FALLBACK="$(cfg usb_iface_fallback)"; [ -n "$USB_IFACE_FALLBACK" ] || USB_IFACE_FALLBACK=wwan
+	USB_MISSING_ACTION="$(cfg usb_missing_action)"; case "$USB_MISSING_ACTION" in reject|fallback) ;; *) USB_MISSING_ACTION=reject ;; esac
+	USB_MISSING_FALLBACK="$(cfg_bool usb_missing_fallback)"
+	CAMPUS_FAILOVER="$(cfg campus_failover)"; [ -n "$CAMPUS_FAILOVER" ] || CAMPUS_FAILOVER=1; case "$CAMPUS_FAILOVER" in 1|yes|true|on|enabled) CAMPUS_FAILOVER=1 ;; *) CAMPUS_FAILOVER=0 ;; esac
+	CAMPUS_HEALTHCHECK="$(cfg campus_healthcheck)"; [ -n "$CAMPUS_HEALTHCHECK" ] || CAMPUS_HEALTHCHECK=1; case "$CAMPUS_HEALTHCHECK" in 1|yes|true|on|enabled) CAMPUS_HEALTHCHECK=1 ;; *) CAMPUS_HEALTHCHECK=0 ;; esac
+	CAMPUS_UNAVAILABLE_ACTION="$(cfg campus_unavailable_action)"; case "$CAMPUS_UNAVAILABLE_ACTION" in usb|reject) ;; *) CAMPUS_UNAVAILABLE_ACTION=usb ;; esac
+	CAMPUS_PROBE_HOSTS="$(list_csv campus_probe_host)"; [ -n "$CAMPUS_PROBE_HOSTS" ] || CAMPUS_PROBE_HOSTS='223.5.5.5,180.76.76.76'
+	# Keep the captive-portal endpoint on the campus path even while the
+	# campus uplink is marked unhealthy. Prefer an explicit list, then reuse
+	# the Dr.COM configuration when it is present; only literal addresses are
+	# accepted by the firewall rule builder below.
+	CAMPUS_PORTAL_HOSTS="$(list_csv campus_portal_host)"
+	[ -n "$CAMPUS_PORTAL_HOSTS" ] || CAMPUS_PORTAL_HOSTS="$(uci -q get drcom.main.portal_host 2>/dev/null)"
+	CAMPUS_STATUS_PATH="$(uci -q get drcom.main.status_path 2>/dev/null)"; [ -n "$CAMPUS_STATUS_PATH" ] || CAMPUS_STATUS_PATH=/drcom/chkstatus
+	CAMPUS_STATUS_CALLBACK="$(uci -q get drcom.main.callback 2>/dev/null)"; [ -n "$CAMPUS_STATUS_CALLBACK" ] || CAMPUS_STATUS_CALLBACK=dr1003
+	CAMPUS_PROBE_TIMEOUT="$(cfg campus_probe_timeout)"; case "$CAMPUS_PROBE_TIMEOUT" in ''|*[!0-9]*) CAMPUS_PROBE_TIMEOUT=2 ;; esac
+	[ "$CAMPUS_PROBE_TIMEOUT" -ge 1 ] 2>/dev/null || CAMPUS_PROBE_TIMEOUT=1
+	[ "$CAMPUS_PROBE_TIMEOUT" -le 15 ] 2>/dev/null || CAMPUS_PROBE_TIMEOUT=15
+	CAMPUS_FAIL_THRESHOLD="$(cfg campus_fail_threshold)"; case "$CAMPUS_FAIL_THRESHOLD" in ''|*[!0-9]*) CAMPUS_FAIL_THRESHOLD=1 ;; esac
+	[ "$CAMPUS_FAIL_THRESHOLD" -ge 1 ] 2>/dev/null || CAMPUS_FAIL_THRESHOLD=1
+	[ "$CAMPUS_FAIL_THRESHOLD" -le 10 ] 2>/dev/null || CAMPUS_FAIL_THRESHOLD=10
+	CAMPUS_RECOVER_THRESHOLD="$(cfg campus_recover_threshold)"; case "$CAMPUS_RECOVER_THRESHOLD" in ''|*[!0-9]*) CAMPUS_RECOVER_THRESHOLD=2 ;; esac
+	[ "$CAMPUS_RECOVER_THRESHOLD" -ge 1 ] 2>/dev/null || CAMPUS_RECOVER_THRESHOLD=1
+	[ "$CAMPUS_RECOVER_THRESHOLD" -le 10 ] 2>/dev/null || CAMPUS_RECOVER_THRESHOLD=10
+	PLUGIN_COMPAT="$(cfg_bool plugin_compat)"
+	IPV6="$(cfg_bool ipv6)"
+	UNKNOWN_POLICY="$(cfg unknown_policy)"; case "$UNKNOWN_POLICY" in campus|usb|reject) ;; *) UNKNOWN_POLICY=usb ;; esac
+	DOMESTIC_PRECEDENCE="$(cfg_bool domestic_precedence)"
+	ENCRYPTED_TCP="$(list_csv encrypted_tcp)"
+	ENCRYPTED_UDP="$(list_csv encrypted_udp)"
+	SCOPE="$(cfg scope)"; case "$SCOPE" in router_only|lan_only|router_and_lan) ;; *) SCOPE=router_and_lan ;; esac
+	RECONCILE_INTERVAL="$(cfg reconcile_interval)"; case "$RECONCILE_INTERVAL" in ''|*[!0-9]*) RECONCILE_INTERVAL=30 ;; esac
+	[ "$RECONCILE_INTERVAL" -ge 15 ] 2>/dev/null || RECONCILE_INTERVAL=15
+	MAXELEM="$(cfg maxelem)"; case "$MAXELEM" in ''|*[!0-9]*) MAXELEM=200000 ;; esac
+	CN4_FILE="$(cfg cn4_file)"; [ -n "$CN4_FILE" ] || CN4_FILE="$RULE_DIR/cn4.txt"
+	CN6_FILE="$(cfg cn6_file)"; [ -n "$CN6_FILE" ] || CN6_FILE="$RULE_DIR/cn6.txt"
+	GEO_FILE="$(cfg geosite_file)"; [ -n "$GEO_FILE" ] || GEO_FILE="$RULE_DIR/geosite-cn.txt"
+	CAMPUS_TABLE_CFG="$(cfg campus_table)"; USB_TABLE_CFG="$(cfg usb_table)"; BLOCK_TABLE_CFG="$(cfg block_table)"
+	MASK_CFG="$(cfg mark_mask)"; case "$MASK_CFG" in 0x[0-9a-fA-F]*) MASK="$(printf '%s' "$MASK_CFG" | tr 'A-F' 'a-f')" ;; esac
+}
+
+check_backends() {
+	local v
+	IPT4="$(command -v iptables-legacy 2>/dev/null)"; IPT6="$(command -v ip6tables-legacy 2>/dev/null)"
+	if [ -z "$IPT4" ] && command -v iptables >/dev/null 2>&1; then v="$(iptables --version 2>/dev/null)"; case "$v" in *legacy*) IPT4="$(command -v iptables)" ;; esac; fi
+	if [ -z "$IPT6" ] && command -v ip6tables >/dev/null 2>&1; then v="$(ip6tables --version 2>/dev/null)"; case "$v" in *legacy*) IPT6="$(command -v ip6tables)" ;; esac; fi
+	[ -n "$IPT4" ] || { set_error 'iptables-legacy backend is required'; return 1; }
+	[ "$IPV6" -eq 1 ] && [ -n "$IPT6" ] || [ "$IPV6" -eq 0 ] || { set_error 'ip6tables-legacy backend is required for IPv6'; return 1; }
+	for v in ip ipset uci; do command -v "$v" >/dev/null 2>&1 || { set_error "missing dependency: $v"; return 1; }; done
+	return 0
+}
+
+resolve_dev() {
+	local logical="$1" json dev
+	dev=""
+	if command -v ubus >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1; then
+		json="$(ubus -S call network.interface."$logical" status 2>/dev/null)"
+		dev="$(printf '%s' "$json" | jsonfilter -e '@.l3_device' 2>/dev/null)"
+		[ -n "$dev" ] || dev="$(printf '%s' "$json" | jsonfilter -e '@.device' 2>/dev/null)"
+	fi
+	[ -n "$dev" ] || dev="$logical"
+	[ -e "/sys/class/net/$dev" ] || dev=""
+	printf '%s\n' "$dev"
+}
+
+route_line() {
+	local af="$1" dev="$2" line
+	[ -n "$dev" ] || return 0
+	line="$(ip -$af route show default dev "$dev" 2>/dev/null | head -n 1)"
+	# QWRT may keep a WAN default in a policy table instead of main.
+	[ -n "$line" ] || line="$(ip -$af route show table all default dev "$dev" 2>/dev/null | head -n 1 | sed 's/ table [^ ]*//g')"
+	printf '%s\n' "$line"
+}
+route_gw() { local line="$1" word next; for word in $line; do [ "$next" = 1 ] && { printf '%s\n' "$word"; return 0; }; [ "$word" = via ] && next=1; done; }
+iface_index() { [ -n "$1" ] && cat "/sys/class/net/$1/ifindex" 2>/dev/null; }
+iface_addr() { local af="$1" dev="$2"; [ -n "$dev" ] || return 0; ip -$af -o addr show dev "$dev" scope global 2>/dev/null | awk 'NR == 1 { print $4; exit }'; }
+
+select_interfaces() {
+	# Policy tables are selected before fwmark lookup, so every table must also
+	# contain the LAN connected route.  Otherwise marked reply packets to a LAN
+	# client fall through to the WAN default and appear as intermittent outages.
+	CAMPUS_LAN_DEV="$(resolve_dev lan)"
+	CAMPUS_DEV="$(resolve_dev "$CAMPUS_IFACE")"; CAMPUS_IFINDEX="$(iface_index "$CAMPUS_DEV")"; CAMPUS_ROUTE4="$(route_line 4 "$CAMPUS_DEV")"; CAMPUS_ROUTE6="$(route_line 6 "$CAMPUS_DEV")"; CAMPUS_GW="$(route_gw "$CAMPUS_ROUTE4")"; CAMPUS_GW6="$(route_gw "$CAMPUS_ROUTE6")"; CAMPUS_SRC4="$(iface_addr 4 "$CAMPUS_DEV")"; CAMPUS_SRC6="$(iface_addr 6 "$CAMPUS_DEV")"
+	CAMPUS_LINK_UP=0; CAMPUS_ONLINE=0; CAMPUS_ONLINE_REASON=missing
+	if [ -n "$CAMPUS_DEV" ] && { [ -n "$CAMPUS_ROUTE4" ] || [ -n "$CAMPUS_ROUTE6" ]; }; then CAMPUS_LINK_UP=1; CAMPUS_ONLINE=1; CAMPUS_ONLINE_REASON=default_route; fi
+	USB_DEV="$(resolve_dev "$USB_IFACE_PRIMARY")"; USB_LOGICAL="$USB_IFACE_PRIMARY"; USB_ROUTE4="$(route_line 4 "$USB_DEV")"; USB_ROUTE6="$(route_line 6 "$USB_DEV")"
+	# Prefer wanusb, but use wwan when the primary exists without a usable
+	# default route (common while USB tethering is still negotiating DHCP).
+	if [ -z "$USB_ROUTE4" ] && [ -z "$USB_ROUTE6" ]; then USB_DEV="$(resolve_dev "$USB_IFACE_FALLBACK")"; USB_LOGICAL="$USB_IFACE_FALLBACK"; USB_ROUTE4="$(route_line 4 "$USB_DEV")"; USB_ROUTE6="$(route_line 6 "$USB_DEV")"; fi
+	USB_IFINDEX="$(iface_index "$USB_DEV")"; USB_GW="$(route_gw "$USB_ROUTE4")"; USB_GW6="$(route_gw "$USB_ROUTE6")"; USB_ONLINE=0; USB_ONLINE4=0; USB_ONLINE6=0; USB_ONLINE_REASON=missing
+	[ -n "$USB_ROUTE4" ] && USB_ONLINE4=1
+	[ -n "$USB_ROUTE6" ] && USB_ONLINE6=1
+	if [ -n "$USB_DEV" ]; then
+		if [ "$USB_ONLINE4" -eq 1 ] || [ "$USB_ONLINE6" -eq 1 ]; then USB_ONLINE=1; USB_ONLINE_REASON=default_route; else USB_ONLINE_REASON=no_default_route; fi
+	fi
+	[ -n "$CAMPUS_DEV" ] || set_error "campus interface $CAMPUS_IFACE is unavailable"
+}
+
+state_get() { local key="$1"; [ -f "$STATE_FILE" ] && awk -F= -v k="$key" '$1 == k { print substr($0, index($0,"=")+1); exit }' "$STATE_FILE" 2>/dev/null; }
+health_get() { local key="$1"; [ -f "$HEALTH_FILE" ] && awk -F= -v k="$key" '$1 == k { print substr($0, index($0,"=")+1); exit }' "$HEALTH_FILE" 2>/dev/null; }
+signature_get() { [ -f "$1" ] && sed -n '1p' "$1" 2>/dev/null; }
+
+hash_stream() {
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256sum | awk '{print $1}'
+	else
+		# BusyBox always provides cksum on the target images. It is less strong
+		# than SHA-256 but still gives a stable change detector for this cache.
+		cksum | awk '{print $1 ":" $2}'
+	fi
+}
+
+file_fingerprint() {
+	local file="$1"
+	[ -f "$file" ] || { printf 'missing\n'; return 0; }
+	# Avoid hashing multi-megabyte CN lists on every 30-second health tick.
+	# Rule updates use atomic replacement, so size + mtime + inode changes even
+	# when a replacement happens to contain the same number of bytes.
+	if command -v stat >/dev/null 2>&1; then
+		stat -c '%s:%Y:%i' "$file" 2>/dev/null && return 0
+	fi
+	cksum "$file" 2>/dev/null | awk '{print $1 ":" $2}'
+}
+
+route_fingerprint() {
+	local af="$1" dev="$2" default_line="$3"
+	{
+		printf '%s\n' "$default_line"
+		[ -n "$dev" ] && ip -"$af" route show dev "$dev" scope link 2>/dev/null
+	} | sed 's/[[:space:]]expires[[:space:]][^[:space:]]*//g; s/[[:space:]]age[[:space:]][^[:space:]]*//g' | sort -u | hash_stream
+}
+
+write_signature() {
+	local file="$1" value="$2" tmp="$1.tmp.$$"
+	printf '%s\n' "$value" > "$tmp" && mv -f "$tmp" "$file"
+}
+
+stats_get() { local key="$1"; [ -f "$STATS_FILE" ] && awk -F= -v k="$key" '$1 == k { print $2; exit }' "$STATS_FILE" 2>/dev/null; }
+
+record_reconcile_action() {
+	local action="$1" full policy health tmp value
+	full="$(stats_get full_rebuilds)"; policy="$(stats_get policy_updates)"; health="$(stats_get health_ticks)"
+	case "$full" in ''|*[!0-9]*) full=0 ;; esac
+	case "$policy" in ''|*[!0-9]*) policy=0 ;; esac
+	case "$health" in ''|*[!0-9]*) health=0 ;; esac
+	case "$action" in
+		full) full=$((full + 1)) ;;
+		policy) policy=$((policy + 1)) ;;
+		health) health=$((health + 1)) ;;
+	esac
+	tmp="$STATS_FILE.tmp.$$"
+	{
+		printf 'full_rebuilds=%s\npolicy_updates=%s\nhealth_ticks=%s\nlast_action=%s\nupdated=%s\n' \
+			"$full" "$policy" "$health" "$action" \
+			"$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)"
+	} > "$tmp" && mv -f "$tmp" "$STATS_FILE"
+	LAST_RECONCILE_ACTION="$action"
+}
+
+build_data_signature() {
+	{
+		# UCI catches policy/config changes; the explicit runtime fields catch
+		# hotplug, DHCP renewal, route, address and selected-table changes.
+		uci -q show "$CONFIG.main" 2>/dev/null
+		printf 'campus_dev=%s\ncampus_ifindex=%s\ncampus_routes4=%s\ncampus_routes6=%s\ncampus_src4=%s\ncampus_src6=%s\n' \
+			"$CAMPUS_DEV" "$CAMPUS_IFINDEX" "$(route_fingerprint 4 "$CAMPUS_DEV" "$CAMPUS_ROUTE4")" "$(route_fingerprint 6 "$CAMPUS_DEV" "$CAMPUS_ROUTE6")" "$CAMPUS_SRC4" "$CAMPUS_SRC6"
+		printf 'usb_logical=%s\nusb_dev=%s\nusb_ifindex=%s\nusb_routes4=%s\nusb_routes6=%s\n' \
+			"$USB_LOGICAL" "$USB_DEV" "$USB_IFINDEX" "$(route_fingerprint 4 "$USB_DEV" "$USB_ROUTE4")" "$(route_fingerprint 6 "$USB_DEV" "$USB_ROUTE6")"
+		printf 'campus_table=%s\nusb_table=%s\nblock_table=%s\nportal_hosts=%s\nstatus_path=%s\nstatus_callback=%s\n' \
+			"$CAMPUS_TABLE" "$USB_TABLE" "$BLOCK_TABLE" "$CAMPUS_PORTAL_HOSTS" "$CAMPUS_STATUS_PATH" "$CAMPUS_STATUS_CALLBACK"
+		printf 'lan_dev=%s\nlan_routes4=%s\nlan_routes6=%s\n' \
+			"$CAMPUS_LAN_DEV" "$(route_fingerprint 4 "$CAMPUS_LAN_DEV" '')" "$(route_fingerprint 6 "$CAMPUS_LAN_DEV" '')"
+		printf 'cn4=%s\ncn6=%s\ngeosite=%s\n' \
+			"$(file_fingerprint "$CN4_FILE")" "$(file_fingerprint "$CN6_FILE")" "$(file_fingerprint "$GEO_FILE")"
+	} | hash_stream
+}
+
+build_policy_signature() {
+	{
+		# Health counters/reasons are deliberately excluded: only fields that
+		# can alter an effective mark target require a firewall-chain update.
+		printf 'campus_online=%s\ncampus_route4=%s\ncampus_route6=%s\nusb_online4=%s\nusb_online6=%s\n' \
+			"$CAMPUS_ONLINE" "${CAMPUS_ROUTE4:+1}" "${CAMPUS_ROUTE6:+1}" "$USB_ONLINE4" "$USB_ONLINE6"
+		printf 'failover=%s\nusb_fallback=%s\nunknown=%s\nipv6=%s\nforce_reclassify=%s\n' \
+			"$CAMPUS_FAILOVER" "$USB_MISSING_FALLBACK" "$UNKNOWN_POLICY" "$IPV6" "$FORCE_RECLASSIFY"
+	} | hash_stream
+}
+
+# Probe one literal IP through the campus interface.  The firewall installs a
+# destination-specific campus mark for these probe addresses, so a successful
+# reply cannot be accidentally supplied by the USB default route.
+probe_one() {
+	local host="$1" url
+	case "$host" in
+		*:* )
+			[ "$IPV6" -eq 1 ] || return 1
+			if command -v ping6 >/dev/null 2>&1; then
+				ping6 -q -I "$CAMPUS_DEV" -c 1 -W "$CAMPUS_PROBE_TIMEOUT" "$host" >/dev/null 2>&1 && return 0
+			elif command -v ping >/dev/null 2>&1; then
+				ping -6 -q -I "$CAMPUS_DEV" -c 1 -W "$CAMPUS_PROBE_TIMEOUT" "$host" >/dev/null 2>&1 && return 0
+			fi
+			url="http://[$host]/"
+			;;
+		* )
+			if command -v ping >/dev/null 2>&1; then
+				ping -q -I "$CAMPUS_DEV" -c 1 -W "$CAMPUS_PROBE_TIMEOUT" "$host" >/dev/null 2>&1 && return 0
+			fi
+			url="http://$host/"
+			;;
+	esac
+	if command -v curl >/dev/null 2>&1; then
+		curl -fsS --interface "$CAMPUS_DEV" --connect-timeout "$CAMPUS_PROBE_TIMEOUT" --max-time "$CAMPUS_PROBE_TIMEOUT" -o /dev/null "$url" >/dev/null 2>&1 && return 0
+		return 1
+	fi
+	command -v ping >/dev/null 2>&1 || command -v ping6 >/dev/null 2>&1 || return 2
+	return 1
+}
+
+probe_drcom_status() {
+	local host response result replied=0
+	[ -n "$CAMPUS_PORTAL_HOSTS" ] || return 2
+	command -v curl >/dev/null 2>&1 || return 2
+	for host in $(printf '%s' "$CAMPUS_PORTAL_HOSTS" | tr ',' ' '); do
+		[ -n "$host" ] || continue
+		case "$host" in *[!0-9A-Fa-f:./]*) continue ;; esac
+		response="$(curl -sS --connect-timeout "$CAMPUS_PROBE_TIMEOUT" --max-time "$CAMPUS_PROBE_TIMEOUT" \
+			--interface "$CAMPUS_DEV" "http://$host$CAMPUS_STATUS_PATH?callback=$CAMPUS_STATUS_CALLBACK" 2>/dev/null)"
+		[ -n "$response" ] || continue
+		replied=1
+		result="$(printf '%s' "$response" | sed -n 's/.*"result"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+		case "$result" in
+			1) return 0 ;;
+			0) return 1 ;;
+			*) : ;;
+		esac
+	done
+	[ "$replied" -eq 1 ] && return 2
+	return 2
+}
+
+campus_probe() {
+	local host rc tool=0 drcom_rc
+	[ "$CAMPUS_LINK_UP" -eq 1 ] || return 1
+	# A configured Dr.COM status endpoint is the most direct signal around a
+	# scheduled campus cutoff. If it is unavailable, continue with literal
+	# public probes so a portal hiccup does not hide a healthy uplink.
+	probe_drcom_status; drcom_rc=$?
+	[ "$drcom_rc" -eq 0 ] && return 0
+	[ "$drcom_rc" -eq 1 ] && [ -n "$CAMPUS_PORTAL_HOSTS" ] && return 1
+	for host in $(printf '%s' "$CAMPUS_PROBE_HOSTS" | tr ',' ' '); do
+		[ -n "$host" ] || continue
+		case "$host" in *[!0-9A-Fa-f:./]*) continue ;; esac
+		rc=0; probe_one "$host" || rc=$?
+		[ "$rc" -ne 2 ] && tool=1
+		[ "$rc" -eq 0 ] && return 0
+	done
+	[ "$tool" -eq 0 ] && return 2
+	return 1
+}
+
+save_health() {
+	local tmp="$HEALTH_FILE.tmp.$$"
+	{
+		printf 'state=%s\nfailures=%s\nsuccesses=%s\nreason=%s\nprobe_hosts=%s\nupdated=%s\n' \
+			"$CAMPUS_HEALTH_STATE" "$CAMPUS_HEALTH_FAILURES" "$CAMPUS_HEALTH_SUCCESSES" \
+			"$CAMPUS_ONLINE_REASON" "$CAMPUS_PROBE_HOSTS" \
+			"$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)"
+	} > "$tmp" && mv -f "$tmp" "$HEALTH_FILE"
+}
+
+update_campus_health() {
+	local previous fail success probe_rc
+	previous="$(health_get state)"; fail="$(health_get failures)"; success="$(health_get successes)"
+	# A first health sample starts from the link/default-route assumption so a
+	# configured failure threshold greater than one still has the advertised
+	# hysteresis instead of failing immediately on an unknown state.
+	[ -n "$previous" ] || previous=online
+	case "$fail" in ''|*[!0-9]*) fail=0 ;; esac
+	case "$success" in ''|*[!0-9]*) success=0 ;; esac
+	CAMPUS_HEALTH_FAILURES="$fail"; CAMPUS_HEALTH_SUCCESSES="$success"
+	if [ "$CAMPUS_FAILOVER" -ne 1 ]; then
+		CAMPUS_HEALTH_STATE=online; CAMPUS_ONLINE_REASON=failover_disabled
+		[ "$CAMPUS_LINK_UP" -eq 1 ] || { CAMPUS_HEALTH_STATE=offline; CAMPUS_ONLINE_REASON=interface_unavailable; }
+	elif [ "$CAMPUS_LINK_UP" -ne 1 ]; then
+		CAMPUS_HEALTH_STATE=offline; CAMPUS_ONLINE=0; CAMPUS_ONLINE_REASON=interface_unavailable
+		CAMPUS_HEALTH_FAILURES=$((fail + 1)); CAMPUS_HEALTH_SUCCESSES=0
+	elif [ "$CAMPUS_HEALTHCHECK" -ne 1 ]; then
+		CAMPUS_HEALTH_STATE=online; CAMPUS_ONLINE=1; CAMPUS_ONLINE_REASON=healthcheck_disabled
+		CAMPUS_HEALTH_FAILURES=0; CAMPUS_HEALTH_SUCCESSES=0
+	else
+		campus_probe; probe_rc=$?
+		case "$probe_rc" in
+			0)
+				CAMPUS_HEALTH_FAILURES=0; CAMPUS_HEALTH_SUCCESSES=$((success + 1))
+				if [ "$previous" = offline ] && [ "$CAMPUS_HEALTH_SUCCESSES" -lt "$CAMPUS_RECOVER_THRESHOLD" ]; then
+					CAMPUS_HEALTH_STATE=offline; CAMPUS_ONLINE_REASON=probe_recovering
+				else
+					CAMPUS_HEALTH_STATE=online; CAMPUS_ONLINE_REASON=probe_ok
+				fi
+				;;
+			1)
+				CAMPUS_HEALTH_SUCCESSES=0; CAMPUS_HEALTH_FAILURES=$((fail + 1))
+				if [ "$previous" = online ] && [ "$CAMPUS_HEALTH_FAILURES" -lt "$CAMPUS_FAIL_THRESHOLD" ]; then
+					CAMPUS_HEALTH_STATE=online; CAMPUS_ONLINE_REASON=probe_degraded
+				else
+					CAMPUS_HEALTH_STATE=offline; CAMPUS_ONLINE_REASON=probe_failed
+				fi
+				;;
+			*)
+				# No ping implementation: retain route/link semantics rather than
+				# forcing a false failover on minimal BusyBox images.
+				CAMPUS_HEALTH_FAILURES=0; CAMPUS_HEALTH_SUCCESSES=0
+				CAMPUS_HEALTH_STATE=online; CAMPUS_ONLINE_REASON=probe_unavailable
+				;;
+		esac
+	fi
+	[ "$CAMPUS_HEALTH_STATE" = online ] && CAMPUS_ONLINE=1 || CAMPUS_ONLINE=0
+	[ "$previous" = "$CAMPUS_HEALTH_STATE" ] || FORCE_RECLASSIFY=1
+	save_health
+}
+
+valid_table() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; [ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 32766 ] 2>/dev/null; }
+used_table() { local t="$1"; ip rule show 2>/dev/null | grep -Eq "lookup[[:space:]]+$t([[:space:]]|$)" && return 0; [ -n "$(ip route show table "$t" 2>/dev/null)" ] && return 0; return 1; }
+owned_table() { local t="$1"; ip rule show 2>/dev/null | grep -Eq "(10010|10020|10030):.*lookup[[:space:]]+$t([[:space:]]|$)"; }
+pick_table() {
+	local t
+	for t in $(seq 100 199 2>/dev/null); do
+		used_table "$t" && continue
+		if [ "$t" = "$CAMPUS_TABLE" ] || [ "$t" = "$USB_TABLE" ] || [ "$t" = "$BLOCK_TABLE" ]; then continue; fi
+		printf '%s\n' "$t"; return 0
+	done
+	return 1
+}
+
+choose_tables() {
+	local old
+	old="$(state_get campus_table)"; if valid_table "$CAMPUS_TABLE_CFG" && { owned_table "$CAMPUS_TABLE_CFG" || ! used_table "$CAMPUS_TABLE_CFG"; }; then CAMPUS_TABLE="$CAMPUS_TABLE_CFG"; elif valid_table "$old" && owned_table "$old"; then CAMPUS_TABLE="$old"; else CAMPUS_TABLE="$(pick_table)"; fi
+	old="$(state_get usb_table)"; if valid_table "$USB_TABLE_CFG" && { owned_table "$USB_TABLE_CFG" || ! used_table "$USB_TABLE_CFG"; }; then USB_TABLE="$USB_TABLE_CFG"; elif valid_table "$old" && owned_table "$old"; then USB_TABLE="$old"; else USB_TABLE="$(pick_table)"; fi
+	old="$(state_get block_table)"; if valid_table "$BLOCK_TABLE_CFG" && { owned_table "$BLOCK_TABLE_CFG" || ! used_table "$BLOCK_TABLE_CFG"; }; then BLOCK_TABLE="$BLOCK_TABLE_CFG"; elif valid_table "$old" && owned_table "$old"; then BLOCK_TABLE="$old"; else BLOCK_TABLE="$(pick_table)"; fi
+	valid_table "$CAMPUS_TABLE" && valid_table "$USB_TABLE" && valid_table "$BLOCK_TABLE" || { set_error 'no free policy routing table'; return 1; }
+	[ "$CAMPUS_TABLE" != "$USB_TABLE" ] && [ "$CAMPUS_TABLE" != "$BLOCK_TABLE" ] && [ "$USB_TABLE" != "$BLOCK_TABLE" ] || { set_error 'policy routing table collision'; return 1; }
+}
+
+flush_table() { local t="$1"; [ -n "$t" ] || return 0; ip -4 route flush table "$t" >/dev/null 2>&1; ip -6 route flush table "$t" >/dev/null 2>&1; }
+populate_table() {
+	local af="$1" dev="$2" table="$3" line args; [ -n "$dev" ] || return 0
+	while IFS= read -r line || [ -n "$line" ]; do
+		[ -n "$line" ] || continue
+		case "$line" in default*) continue ;; esac
+		# `ip route show dev ...` on BusyBox omits the `dev` token.  Re-add
+		# it before installing into an alternate table; otherwise the command
+		# is rejected and the connected route silently disappears.
+		args="$line"
+		case " $args " in *" dev "*) : ;; *) args="$args dev $dev" ;; esac
+		ip -$af route replace table "$table" $args >/dev/null 2>&1
+	done <<EOF
+$(ip -$af route show dev "$dev" scope link 2>/dev/null)
+EOF
+	line="$(route_line "$af" "$dev")"; [ -n "$line" ] && {
+		args="$line"; case " $args " in *" dev "*) : ;; *) args="$args dev $dev" ;; esac
+		ip -$af route replace table "$table" $args >/dev/null 2>&1
+	}
+}
+
+populate_lan_table() {
+	local af="$1" dev="$2" table="$3" line args; [ -n "$dev" ] || return 0
+	# IPv6 prefix-assignment routes may omit `scope link`; copy all non-default
+	# routes for the LAN device and make the device explicit.
+	while IFS= read -r line || [ -n "$line" ]; do
+		[ -n "$line" ] || continue
+		case "$line" in default*) continue ;; esac
+		args="$line"
+		case " $args " in *" dev "*) : ;; *) args="$args dev $dev" ;; esac
+		ip -$af route replace table "$table" $args >/dev/null 2>&1
+	done <<EOF
+$(ip -$af route show dev "$dev" 2>/dev/null)
+EOF
+}
+
+setup_routes() {
+	flush_table "$CAMPUS_TABLE"; flush_table "$USB_TABLE"; flush_table "$BLOCK_TABLE"
+	populate_table 4 "$CAMPUS_DEV" "$CAMPUS_TABLE"; populate_table 4 "$USB_DEV" "$USB_TABLE"
+	# Keep connected LAN prefixes in every policy table.  fwmark rules run
+	# before the main table, so without these entries replies to LAN hosts would
+	# be sent to a WAN default instead of br-lan.
+	populate_lan_table 4 "$CAMPUS_LAN_DEV" "$CAMPUS_TABLE"
+	populate_lan_table 4 "$CAMPUS_LAN_DEV" "$USB_TABLE"
+	populate_lan_table 4 "$CAMPUS_LAN_DEV" "$BLOCK_TABLE"
+	# Every policy table gets an explicit terminal route.  Without it, a failed
+	# table lookup would continue to main and could leak marked traffic.
+	[ -n "$CAMPUS_ROUTE4" ] || ip -4 route replace table "$CAMPUS_TABLE" blackhole default >/dev/null 2>&1
+	[ -n "$USB_ROUTE4" ] || ip -4 route replace table "$USB_TABLE" blackhole default >/dev/null 2>&1
+	ip -4 route replace table "$BLOCK_TABLE" blackhole default >/dev/null 2>&1
+	if [ "$IPV6" -eq 1 ]; then
+		populate_table 6 "$CAMPUS_DEV" "$CAMPUS_TABLE"; populate_table 6 "$USB_DEV" "$USB_TABLE"
+		populate_lan_table 6 "$CAMPUS_LAN_DEV" "$CAMPUS_TABLE"
+		populate_lan_table 6 "$CAMPUS_LAN_DEV" "$USB_TABLE"
+		populate_lan_table 6 "$CAMPUS_LAN_DEV" "$BLOCK_TABLE"
+		[ -n "$CAMPUS_ROUTE6" ] || ip -6 route replace table "$CAMPUS_TABLE" blackhole default >/dev/null 2>&1
+		[ -n "$USB_ROUTE6" ] || ip -6 route replace table "$USB_TABLE" blackhole default >/dev/null 2>&1
+		ip -6 route replace table "$BLOCK_TABLE" blackhole default >/dev/null 2>&1
+	fi
+}
+remove_pref() { local af="$1" pref="$2" n=0; while [ "$n" -lt 8 ]; do ip -$af rule del pref "$pref" >/dev/null 2>&1 || break; n=$((n + 1)); done; }
+setup_rules() {
+	remove_pref 4 "$PREF_CAMPUS"; remove_pref 4 "$PREF_USB"; remove_pref 4 "$PREF_BLOCK"
+	# Always remove stale IPv6 selectors. This matters when IPv6 is switched
+	# off after a previous enabled deployment.
+	remove_pref 6 "$PREF_CAMPUS"; remove_pref 6 "$PREF_USB"; remove_pref 6 "$PREF_BLOCK"
+	ip -4 rule add pref "$PREF_CAMPUS" fwmark "$MARK_CAMPUS/$MASK" table "$CAMPUS_TABLE" >/dev/null 2>&1 || return 1
+	ip -4 rule add pref "$PREF_USB" fwmark "$MARK_USB/$MASK" table "$USB_TABLE" >/dev/null 2>&1 || return 1
+	ip -4 rule add pref "$PREF_BLOCK" fwmark "$MARK_BLOCK/$MASK" table "$BLOCK_TABLE" >/dev/null 2>&1 || return 1
+	if [ "$IPV6" -eq 1 ]; then ip -6 rule add pref "$PREF_CAMPUS" fwmark "$MARK_CAMPUS/$MASK" table "$CAMPUS_TABLE" >/dev/null 2>&1 || return 1; ip -6 rule add pref "$PREF_USB" fwmark "$MARK_USB/$MASK" table "$USB_TABLE" >/dev/null 2>&1 || return 1; ip -6 rule add pref "$PREF_BLOCK" fwmark "$MARK_BLOCK/$MASK" table "$BLOCK_TABLE" >/dev/null 2>&1 || return 1; fi
+	return 0
+}
+
+rule_present() {
+	local af="$1" pref="$2" mark="$3" table="$4"
+	ip -"$af" rule show 2>/dev/null | grep -Eq "^${pref}:.*fwmark[[:space:]]+${mark}/${MASK}.*lookup[[:space:]]+${table}([[:space:]]|$)"
+}
+
+table_has_default() {
+	local af="$1" table="$2"
+	ip -"$af" route show table "$table" 2>/dev/null | grep -Eq '(^|[[:space:]])default([[:space:]]|$)'
+}
+
+table_has_lan_route() {
+	local af="$1" table="$2"
+	[ -n "$CAMPUS_LAN_DEV" ] || return 0
+	ip -"$af" route show table "$table" dev "$CAMPUS_LAN_DEV" 2>/dev/null | grep -q .
+}
+
+ensure_ipset() {
+	local set="$1" family="$2" file="$3" tmp line count=0
+	case "$family" in 4) ipset create "$set" hash:net family inet hashsize 1024 maxelem "$MAXELEM" -exist || return 1 ;; *) ipset create "$set" hash:net family inet6 hashsize 1024 maxelem "$MAXELEM" -exist || return 1 ;; esac
+	tmp="cr$(printf '%s' "$family")n$$"; ipset destroy "$tmp" >/dev/null 2>&1
+	case "$family" in 4) ipset create "$tmp" hash:net family inet hashsize 1024 maxelem "$MAXELEM" -exist || return 1 ;; *) ipset create "$tmp" hash:net family inet6 hashsize 1024 maxelem "$MAXELEM" -exist || return 1 ;; esac
+	if [ -f "$file" ]; then
+		while IFS= read -r line || [ -n "$line" ]; do
+			line="${line%%#*}"; line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"; [ -n "$line" ] || continue
+			ipset add "$tmp" "$line" -exist >/dev/null 2>&1 && count=$((count + 1))
+		done < "$file"
+	fi
+	ipset swap "$tmp" "$set" >/dev/null 2>&1 && ipset destroy "$tmp" >/dev/null 2>&1 || { ipset destroy "$tmp" >/dev/null 2>&1; return 1; }
+	printf 'set%s_count=%s\n' "$family" "$count" >> "$STATE_DIR/sets"; return 0
+}
+
+ensure_geo_ipset() {
+	local set="$1" family="$2"
+	case "$family" in
+		4) ipset create "$set" hash:ip family inet hashsize 1024 maxelem "$MAXELEM" -exist || return 1 ;;
+		6) ipset create "$set" hash:ip family inet6 hashsize 1024 maxelem "$MAXELEM" -exist || return 1 ;;
+		*) return 1 ;;
+	esac
+	return 0
+}
+
+remove_jump() { local cmd="$1" table="$2" chain="$3" target="$4" n=0; while [ "$n" -lt 16 ]; do "$cmd" -t "$table" -D "$chain" -j "$target" >/dev/null 2>&1 || break; n=$((n + 1)); done; }
+remove_chain() { local cmd="$1" table="$2" chain="$3"; remove_jump "$cmd" "$table" PREROUTING "$chain"; remove_jump "$cmd" "$table" OUTPUT "$chain"; remove_jump "$cmd" "$table" FORWARD "$chain"; "$cmd" -t "$table" -F "$chain" >/dev/null 2>&1; "$cmd" -t "$table" -X "$chain" >/dev/null 2>&1; }
+save_mark_return() { local cmd="$1" mark="$2"; "$cmd" -t mangle -A "$MANGLE_CHAIN" -m mark --mark "$mark/$MASK" -j CONNMARK --save-mark --nfmask "$MASK" --ctmask "$MASK" >/dev/null 2>&1; "$cmd" -t mangle -A "$MANGLE_CHAIN" -m mark --mark "$mark/$MASK" -j RETURN >/dev/null 2>&1; }
+
+add_policy_rules() {
+	local cmd="$1" family="$2" set="$3" geoset="$4" usb_target="$5" unknown_target="$6" tcp_ports="$7" udp_ports="$8" campus_target="$9" probe_src="${10}" restore_mask="$MASK" host
+	[ -n "$campus_target" ] || campus_target="$MARK_CAMPUS"
+	[ "$PLUGIN_COMPAT" -eq 1 ] && restore_mask=0xffffffff
+	"$cmd" -t mangle -N "$MANGLE_CHAIN" >/dev/null 2>&1; "$cmd" -t mangle -F "$MANGLE_CHAIN" >/dev/null 2>&1
+	"$cmd" -t mangle -A "$MANGLE_CHAIN" -j CONNMARK --restore-mark --nfmask "$restore_mask" --ctmask "$restore_mask" >/dev/null 2>&1
+	# Force configured health probes through the campus policy table. Rules are
+	# destination-specific so ordinary router traffic is unaffected during USB
+	# failover. Only literal IP addresses are accepted here.
+	for host in $(printf '%s' "$CAMPUS_PROBE_HOSTS" | tr ',' ' '); do
+		case "$host" in
+			*[!0-9A-Fa-f:./]*) continue ;;
+			*:* ) [ "$family" = 6 ] || continue ;;
+			* ) [ "$family" = 4 ] || continue ;;
+		esac
+		# Match the destination unconditionally. This also covers ping builds
+		# that do not expose a stable source address when bound to an interface.
+		"$cmd" -t mangle -A "$MANGLE_CHAIN" -d "$host" -j MARK --set-xmark "$MARK_CAMPUS/$MASK" >/dev/null 2>&1
+		save_mark_return "$cmd" "$MARK_CAMPUS"
+	done
+	# Captive-portal traffic must remain reachable through campus so Dr.COM can
+	# re-authenticate when the uplink recovers; do not let failover remap it to
+	# USB or BLOCK. Only literal portal addresses from UCI are accepted.
+	for host in $(printf '%s' "$CAMPUS_PORTAL_HOSTS" | tr ',' ' '); do
+		case "$host" in
+			*[!0-9A-Fa-f:./]*) continue ;;
+			*:* ) [ "$family" = 6 ] || continue ;;
+			* ) [ "$family" = 4 ] || continue ;;
+		esac
+		"$cmd" -t mangle -A "$MANGLE_CHAIN" -d "$host" -j MARK --set-xmark "$MARK_CAMPUS/$MASK" >/dev/null 2>&1
+		save_mark_return "$cmd" "$MARK_CAMPUS"
+	done
+	# lan_only still needs the OUTPUT jump for probes, but all other router
+	# traffic must return here before policy classification.
+	[ "$SCOPE" = lan_only ] && "$cmd" -t mangle -A "$MANGLE_CHAIN" -j RETURN >/dev/null 2>&1
+	# Reclassify existing policy-marked connections once after a campus health
+	# transition. This lets domestic flows move back to campus after recovery,
+	# while overseas flows are immediately classified for USB again.
+	if [ "$FORCE_RECLASSIFY" -eq 1 ]; then
+		# Clear only the policy high nibble; plugin/application bits below MASK
+		# remain intact in connmark and packet mark.
+		"$cmd" -t mangle -A "$MANGLE_CHAIN" -m connmark --mark "$MARK_CAMPUS/$MASK" -j CONNMARK --set-xmark 0x0/"$MASK" >/dev/null 2>&1
+		"$cmd" -t mangle -A "$MANGLE_CHAIN" -m connmark --mark "$MARK_USB/$MASK" -j CONNMARK --set-xmark 0x0/"$MASK" >/dev/null 2>&1
+		"$cmd" -t mangle -A "$MANGLE_CHAIN" -m mark --mark "$MARK_CAMPUS/$MASK" -j MARK --set-xmark 0x0/"$MASK" >/dev/null 2>&1
+		"$cmd" -t mangle -A "$MANGLE_CHAIN" -m mark --mark "$MARK_USB/$MASK" -j MARK --set-xmark 0x0/"$MASK" >/dev/null 2>&1
+	fi
+	if [ "$campus_target" != "$MARK_CAMPUS" ]; then "$cmd" -t mangle -A "$MANGLE_CHAIN" -m mark --mark "$MARK_CAMPUS/$MASK" -j MARK --set-xmark "$campus_target/$MASK" >/dev/null 2>&1; save_mark_return "$cmd" "$campus_target"; fi
+	if [ "$usb_target" != "$MARK_USB" ]; then "$cmd" -t mangle -A "$MANGLE_CHAIN" -m mark --mark "$MARK_USB/$MASK" -j MARK --set-xmark "$usb_target/$MASK" >/dev/null 2>&1; save_mark_return "$cmd" "$usb_target"; fi
+	"$cmd" -t mangle -A "$MANGLE_CHAIN" -m mark --mark "$MARK_CAMPUS/$MASK" -j RETURN >/dev/null 2>&1; "$cmd" -t mangle -A "$MANGLE_CHAIN" -m mark --mark "$MARK_USB/$MASK" -j RETURN >/dev/null 2>&1; "$cmd" -t mangle -A "$MANGLE_CHAIN" -m mark --mark "$MARK_BLOCK/$MASK" -j RETURN >/dev/null 2>&1
+	[ "$PLUGIN_COMPAT" -eq 1 ] && "$cmd" -t mangle -A "$MANGLE_CHAIN" -m mark ! --mark 0x0/0xffffffff -j RETURN >/dev/null 2>&1
+	if [ "$family" = 4 ]; then for cidr in 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.168.0.0/16 198.18.0.0/15 224.0.0.0/4 240.0.0.0/4; do "$cmd" -t mangle -A "$MANGLE_CHAIN" -d "$cidr" -j RETURN >/dev/null 2>&1; done; else for cidr in ::/128 ::1/128 fc00::/7 fe80::/10 ff00::/8 2001:db8::/32; do "$cmd" -t mangle -A "$MANGLE_CHAIN" -d "$cidr" -j RETURN >/dev/null 2>&1; done; fi
+	"$cmd" -t mangle -A "$MANGLE_CHAIN" -p udp -m multiport --dports 53,123 -j MARK --set-xmark "$campus_target/$MASK" >/dev/null 2>&1; save_mark_return "$cmd" "$campus_target"
+	"$cmd" -t mangle -A "$MANGLE_CHAIN" -p tcp --dport 53 -j MARK --set-xmark "$campus_target/$MASK" >/dev/null 2>&1; save_mark_return "$cmd" "$campus_target"
+	if [ "$DOMESTIC_PRECEDENCE" -eq 1 ]; then
+		[ -n "$geoset" ] && "$cmd" -t mangle -A "$MANGLE_CHAIN" -m set --match-set "$geoset" dst -j MARK --set-xmark "$campus_target/$MASK" >/dev/null 2>&1; [ -n "$geoset" ] && save_mark_return "$cmd" "$campus_target"
+		"$cmd" -t mangle -A "$MANGLE_CHAIN" -m set --match-set "$set" dst -j MARK --set-xmark "$campus_target/$MASK" >/dev/null 2>&1; save_mark_return "$cmd" "$campus_target"
+	fi
+	[ -n "$tcp_ports" ] && "$cmd" -t mangle -A "$MANGLE_CHAIN" -p tcp -m multiport --dports "$tcp_ports" -j MARK --set-xmark "$usb_target/$MASK" >/dev/null 2>&1; [ -n "$tcp_ports" ] && save_mark_return "$cmd" "$usb_target"
+	[ -n "$udp_ports" ] && "$cmd" -t mangle -A "$MANGLE_CHAIN" -p udp -m multiport --dports "$udp_ports" -j MARK --set-xmark "$usb_target/$MASK" >/dev/null 2>&1; [ -n "$udp_ports" ] && save_mark_return "$cmd" "$usb_target"
+	if [ "$DOMESTIC_PRECEDENCE" -ne 1 ]; then
+		[ -n "$geoset" ] && "$cmd" -t mangle -A "$MANGLE_CHAIN" -m set --match-set "$geoset" dst -j MARK --set-xmark "$campus_target/$MASK" >/dev/null 2>&1; [ -n "$geoset" ] && save_mark_return "$cmd" "$campus_target"
+		"$cmd" -t mangle -A "$MANGLE_CHAIN" -m set --match-set "$set" dst -j MARK --set-xmark "$campus_target/$MASK" >/dev/null 2>&1; save_mark_return "$cmd" "$campus_target"
+	fi
+	"$cmd" -t mangle -A "$MANGLE_CHAIN" -j MARK --set-xmark "$unknown_target/$MASK" >/dev/null 2>&1; save_mark_return "$cmd" "$unknown_target"
+}
+
+setup_firewall() {
+	local usb_target4 usb_target6 unknown_target4 unknown_target6 campus_target4 campus_target6
+	usb_target4="$MARK_USB"; usb_target6="$MARK_USB"; campus_target4="$MARK_CAMPUS"; campus_target6="$MARK_CAMPUS"
+	# When the campus uplink loses its default route or health probe, all
+	# otherwise-campus traffic is moved to USB. If USB is also unavailable,
+	# fail closed through the existing block table. Family-specific route checks
+	# prevent IPv6 packets from entering a table that only has IPv4 DHCP state.
+	if [ "$CAMPUS_FAILOVER" -eq 1 ] && { [ "$CAMPUS_ONLINE" -eq 0 ] || [ -z "$CAMPUS_ROUTE4" ]; }; then
+		[ "$USB_ONLINE4" -eq 1 ] && campus_target4="$MARK_USB" || campus_target4="$MARK_BLOCK"
+	fi
+	if [ "$CAMPUS_FAILOVER" -eq 1 ] && [ "$IPV6" -eq 1 ] && { [ "$CAMPUS_ONLINE" -eq 0 ] || [ -z "$CAMPUS_ROUTE6" ]; }; then
+		[ "$USB_ONLINE6" -eq 1 ] && campus_target6="$MARK_USB" || campus_target6="$MARK_BLOCK"
+	fi
+	if [ "$USB_ONLINE4" -eq 0 ]; then
+		# The explicit boolean is the compatibility switch promised by the UI;
+		# usb_missing_action remains a visible policy descriptor for old configs.
+		[ "$USB_MISSING_FALLBACK" -eq 1 ] && [ "$CAMPUS_ONLINE" -eq 1 ] && [ -n "$CAMPUS_ROUTE4" ] && usb_target4="$MARK_CAMPUS" || usb_target4="$MARK_BLOCK"
+	fi
+	if [ "$IPV6" -eq 1 ] && [ "$USB_ONLINE6" -eq 0 ]; then
+		[ "$USB_MISSING_FALLBACK" -eq 1 ] && [ "$CAMPUS_ONLINE" -eq 1 ] && [ -n "$CAMPUS_ROUTE6" ] && usb_target6="$MARK_CAMPUS" || usb_target6="$MARK_BLOCK"
+	fi
+	case "$UNKNOWN_POLICY" in
+		campus) unknown_target4="$campus_target4"; unknown_target6="$campus_target6" ;;
+		reject) unknown_target4="$MARK_BLOCK"; unknown_target6="$MARK_BLOCK" ;;
+		*) unknown_target4="$usb_target4"; unknown_target6="$usb_target6" ;;
+	esac
+	remove_chain "$IPT4" mangle "$MANGLE_CHAIN"; remove_chain "$IPT4" filter "$FILTER_CHAIN"
+	# Remove an old IPv6 policy even when IPv6 has just been disabled.
+	[ -n "$IPT6" ] && { remove_chain "$IPT6" mangle "$MANGLE_CHAIN"; remove_chain "$IPT6" filter "$FILTER_CHAIN"; }
+	add_policy_rules "$IPT4" 4 "$SET4" "$GEO4" "$usb_target4" "$unknown_target4" "$ENCRYPTED_TCP" "$ENCRYPTED_UDP" "$campus_target4" "$CAMPUS_SRC4"; [ "$IPV6" -eq 1 ] && add_policy_rules "$IPT6" 6 "$SET6" "$GEO6" "$usb_target6" "$unknown_target6" "$ENCRYPTED_TCP" "$ENCRYPTED_UDP" "$campus_target6" "$CAMPUS_SRC6"
+	"$IPT4" -t filter -N "$FILTER_CHAIN" >/dev/null 2>&1; "$IPT4" -t filter -F "$FILTER_CHAIN" >/dev/null 2>&1; "$IPT4" -t filter -A "$FILTER_CHAIN" -m mark --mark "$MARK_BLOCK/$MASK" -j REJECT >/dev/null 2>&1
+	# Health probes originate on the router. Keep their mangle jump even when
+	# the user selected lan_only scope; otherwise ping/curl could escape via
+	# USB and falsely report the campus uplink as healthy.
+	if [ "$SCOPE" != lan_only ] || [ "$CAMPUS_HEALTHCHECK" -eq 1 ]; then "$IPT4" -t mangle -A OUTPUT -j "$MANGLE_CHAIN" >/dev/null 2>&1; fi
+	if [ "$SCOPE" != lan_only ]; then "$IPT4" -t filter -I OUTPUT 1 -j "$FILTER_CHAIN" >/dev/null 2>&1; fi
+	if [ "$SCOPE" != router_only ]; then "$IPT4" -t mangle -A PREROUTING -j "$MANGLE_CHAIN" >/dev/null 2>&1; "$IPT4" -t filter -I FORWARD 1 -j "$FILTER_CHAIN" >/dev/null 2>&1; fi
+	if [ "$IPV6" -eq 1 ]; then "$IPT6" -t filter -N "$FILTER_CHAIN" >/dev/null 2>&1; "$IPT6" -t filter -F "$FILTER_CHAIN" >/dev/null 2>&1; "$IPT6" -t filter -A "$FILTER_CHAIN" -m mark --mark "$MARK_BLOCK/$MASK" -j REJECT >/dev/null 2>&1; if [ "$SCOPE" != lan_only ] || [ "$CAMPUS_HEALTHCHECK" -eq 1 ]; then "$IPT6" -t mangle -A OUTPUT -j "$MANGLE_CHAIN" >/dev/null 2>&1; fi; if [ "$SCOPE" != lan_only ]; then "$IPT6" -t filter -I OUTPUT 1 -j "$FILTER_CHAIN" >/dev/null 2>&1; fi; if [ "$SCOPE" != router_only ]; then "$IPT6" -t mangle -A PREROUTING -j "$MANGLE_CHAIN" >/dev/null 2>&1; "$IPT6" -t filter -I FORWARD 1 -j "$FILTER_CHAIN" >/dev/null 2>&1; fi; fi
+	# Every individual iptables invocation above is deliberately quiet, but a
+	# concurrent firewall3/plugin reload can make one or more of them fail. Do
+	# not publish a new policy signature in that case: the next reconcile must
+	# retry instead of silently running with an empty or detached chain.
+	family_firewall_present "$IPT4" || return 1
+	if [ "$IPV6" -eq 1 ]; then family_firewall_present "$IPT6" || return 1; fi
+	printf 'campus_target4=%s\ncampus_target6=%s\nusb_target4=%s\nusb_target6=%s\nunknown_target4=%s\nunknown_target6=%s\ncampus_online=%s\n' "$campus_target4" "$campus_target6" "$usb_target4" "$usb_target6" "$unknown_target4" "$unknown_target6" "$CAMPUS_ONLINE" > "$STATE_DIR/policy"
+}
+
+family_firewall_present() {
+	local cmd="$1"
+	"$cmd" -t mangle -S "$MANGLE_CHAIN" >/dev/null 2>&1 || return 1
+	"$cmd" -t mangle -S "$MANGLE_CHAIN" 2>/dev/null | grep -q -- '--restore-mark' || return 1
+	"$cmd" -t mangle -S "$MANGLE_CHAIN" 2>/dev/null | grep -q -- 'MARK --set-xmark' || return 1
+	"$cmd" -t filter -S "$FILTER_CHAIN" >/dev/null 2>&1 || return 1
+	"$cmd" -t filter -C "$FILTER_CHAIN" -m mark --mark "$MARK_BLOCK/$MASK" -j REJECT >/dev/null 2>&1 || return 1
+	if [ "$SCOPE" != lan_only ] || [ "$CAMPUS_HEALTHCHECK" -eq 1 ]; then
+		"$cmd" -t mangle -C OUTPUT -j "$MANGLE_CHAIN" >/dev/null 2>&1 || return 1
+	fi
+	if [ "$SCOPE" != lan_only ]; then
+		"$cmd" -t filter -C OUTPUT -j "$FILTER_CHAIN" >/dev/null 2>&1 || return 1
+	fi
+	if [ "$SCOPE" != router_only ]; then
+		"$cmd" -t mangle -C PREROUTING -j "$MANGLE_CHAIN" >/dev/null 2>&1 || return 1
+		"$cmd" -t filter -C FORWARD -j "$FILTER_CHAIN" >/dev/null 2>&1 || return 1
+	fi
+	return 0
+}
+
+data_plane_present() {
+	# This is intentionally read-only and cheap. It catches firewall reloads,
+	# plugin chain deletion and lost policy tables without rebuilding healthy
+	# state on every health-check interval.
+	ipset list "$SET4" >/dev/null 2>&1 || return 1
+	ipset list "$GEO4" >/dev/null 2>&1 || return 1
+	if [ "$IPV6" -eq 1 ]; then
+		ipset list "$SET6" >/dev/null 2>&1 || return 1
+		ipset list "$GEO6" >/dev/null 2>&1 || return 1
+	fi
+	rule_present 4 "$PREF_CAMPUS" "$MARK_CAMPUS" "$CAMPUS_TABLE" || return 1
+	rule_present 4 "$PREF_USB" "$MARK_USB" "$USB_TABLE" || return 1
+	rule_present 4 "$PREF_BLOCK" "$MARK_BLOCK" "$BLOCK_TABLE" || return 1
+	table_has_default 4 "$CAMPUS_TABLE" || return 1
+	table_has_default 4 "$USB_TABLE" || return 1
+	table_has_default 4 "$BLOCK_TABLE" || return 1
+	table_has_lan_route 4 "$CAMPUS_TABLE" || return 1
+	table_has_lan_route 4 "$USB_TABLE" || return 1
+	table_has_lan_route 4 "$BLOCK_TABLE" || return 1
+	family_firewall_present "$IPT4" || return 1
+	if [ "$IPV6" -eq 1 ]; then
+		rule_present 6 "$PREF_CAMPUS" "$MARK_CAMPUS" "$CAMPUS_TABLE" || return 1
+		rule_present 6 "$PREF_USB" "$MARK_USB" "$USB_TABLE" || return 1
+		rule_present 6 "$PREF_BLOCK" "$MARK_BLOCK" "$BLOCK_TABLE" || return 1
+		table_has_default 6 "$CAMPUS_TABLE" || return 1
+		table_has_default 6 "$USB_TABLE" || return 1
+		table_has_default 6 "$BLOCK_TABLE" || return 1
+		table_has_lan_route 6 "$CAMPUS_TABLE" || return 1
+		table_has_lan_route 6 "$USB_TABLE" || return 1
+		table_has_lan_route 6 "$BLOCK_TABLE" || return 1
+		family_firewall_present "$IPT6" || return 1
+	fi
+	return 0
+}
+
+setup_geosite() {
+	local tmp line domain count=0 old_hash new_hash
+	# dnsmasq's ipset= directive populates address sets from DNS answers. Keep
+	# these separate from static GeoIP sets so GeoSite has its own priority.
+	mkdir -p "$(dirname "$DNSMASQ_CONF")" || return 1
+	if [ "$IPV6" -eq 1 ]; then
+		ensure_geo_ipset "$GEO6" 6 || return 1
+	fi
+	ensure_geo_ipset "$GEO4" 4 || return 1
+	if [ ! -f "$GEO_FILE" ]; then
+		ipset flush "$GEO4" >/dev/null 2>&1 || true
+		[ "$IPV6" -eq 1 ] && ipset flush "$GEO6" >/dev/null 2>&1 || true
+		rm -f "$DNSMASQ_CONF"
+		killall -HUP dnsmasq 2>/dev/null || true
+		GEO_DOMAINS=0
+		return 0
+	fi
+	tmp="$DNSMASQ_CONF.tmp.$$"; : > "$tmp" || return 1
+	while IFS= read -r line || [ -n "$line" ]; do
+		line="$(printf '%s' "$line" | sed 's/#.*$//; s/^[[:space:]]*//; s/[[:space:]]*$//')"
+		[ -n "$line" ] || continue
+		case "$line" in
+			domain:*) domain="$(printf '%s' "$line" | cut -d: -f2-)" ;;
+			full:*) domain="$(printf '%s' "$line" | cut -d: -f2-)" ;;
+			'||'*) domain="$(printf '%s' "$line" | sed 's/^||//')" ;;
+			+.*) domain="$(printf '%s' "$line" | sed 's/^+\.//')" ;;
+			*) domain="$line" ;;
+		esac
+		domain="$(printf '%s' "$domain" | sed 's/^[.]//; s#/.*$##; s/[[:space:]].*$//')"
+		printf '%s' "$domain" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*\.[A-Za-z]{2,}$' || continue
+		if [ "$IPV6" -eq 1 ]; then
+			printf 'ipset=/%s/%s,%s\n' "$domain" "$GEO4" "$GEO6" >> "$tmp"
+		else
+			printf 'ipset=/%s/%s\n' "$domain" "$GEO4" >> "$tmp"
+		fi
+		count=$((count + 1))
+		[ "$count" -ge "$MAXELEM" ] && break
+	done < "$GEO_FILE"
+	if [ "$count" -le 0 ]; then
+		rm -f "$tmp" "$DNSMASQ_CONF"
+		ipset flush "$GEO4" >/dev/null 2>&1 || true
+		[ "$IPV6" -eq 1 ] && ipset flush "$GEO6" >/dev/null 2>&1 || true
+		killall -HUP dnsmasq 2>/dev/null || true
+		GEO_DOMAINS=0
+		return 0
+	fi
+	# Replace the generated include atomically. Flush only when contents change.
+	old_hash="$(sha256sum "$DNSMASQ_CONF" 2>/dev/null | awk '{print $1}')"
+	new_hash="$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}')"
+	if [ "$old_hash" != "$new_hash" ]; then
+		ipset flush "$GEO4" >/dev/null 2>&1 || true
+		[ "$IPV6" -eq 1 ] && ipset flush "$GEO6" >/dev/null 2>&1 || true
+		mv -f "$tmp" "$DNSMASQ_CONF" || { rm -f "$tmp"; return 1; }
+		killall -HUP dnsmasq 2>/dev/null || true
+	else
+		rm -f "$tmp"
+	fi
+	GEO_DOMAINS="$count"
+}
+
+remove_firewall() { remove_chain "$IPT4" mangle "$MANGLE_CHAIN"; remove_chain "$IPT4" filter "$FILTER_CHAIN"; remove_chain "$IPT6" mangle "$MANGLE_CHAIN"; remove_chain "$IPT6" filter "$FILTER_CHAIN"; }
+remove_routes() { [ -n "$CAMPUS_TABLE" ] || CAMPUS_TABLE="$(state_get campus_table)"; [ -n "$USB_TABLE" ] || USB_TABLE="$(state_get usb_table)"; [ -n "$BLOCK_TABLE" ] || BLOCK_TABLE="$(state_get block_table)"; remove_pref 4 "$PREF_CAMPUS"; remove_pref 4 "$PREF_USB"; remove_pref 4 "$PREF_BLOCK"; remove_pref 6 "$PREF_CAMPUS"; remove_pref 6 "$PREF_USB"; remove_pref 6 "$PREF_BLOCK"; flush_table "$CAMPUS_TABLE"; flush_table "$USB_TABLE"; flush_table "$BLOCK_TABLE"; }
+remove_sets() { ipset destroy "$SET4" >/dev/null 2>&1; ipset destroy "$SET6" >/dev/null 2>&1; ipset destroy "$GEO4" >/dev/null 2>&1; ipset destroy "$GEO6" >/dev/null 2>&1; }
+# The lock is shared by procd reloads, the daemon, cron, and hotplug hooks.
+# Only remove a lock owned by this process.  In particular, an old process
+# must not delete a newer owner's lock after a stale-lock takeover.
+acquire_lock() {
+	local pid
+	if mkdir "$LOCK_DIR" 2>/dev/null; then
+		printf '%s\n' "$$" > "$LOCK_DIR/pid"
+		return 0
+	fi
+	pid="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
+	# A freshly-created lock can briefly exist before its pid file is written.
+	# Do not remove it in that window; retrying on the next reconcile is safer
+	# than allowing two writers to flush policy tables concurrently.
+	[ -n "$pid" ] || return 1
+	[ "$pid" = "$$" ] && return 1
+	kill -0 "$pid" 2>/dev/null && return 1
+	rm -rf "$LOCK_DIR" 2>/dev/null || return 1
+	mkdir "$LOCK_DIR" 2>/dev/null || return 1
+	printf '%s\n' "$$" > "$LOCK_DIR/pid"
+}
+release_lock() {
+	[ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ] || return 0
+	rm -rf "$LOCK_DIR" 2>/dev/null
+}
+write_runtime_state() {
+	local tmp="$STATE_FILE.tmp.$$" full policy health
+	full="$(stats_get full_rebuilds)"; policy="$(stats_get policy_updates)"; health="$(stats_get health_ticks)"
+	case "$full" in ''|*[!0-9]*) full=0 ;; esac
+	case "$policy" in ''|*[!0-9]*) policy=0 ;; esac
+	case "$health" in ''|*[!0-9]*) health=0 ;; esac
+	{
+		printf 'enabled=%s\ncampus_iface=%s\ncampus_dev=%s\ncampus_ifindex=%s\ncampus_gw=%s\ncampus_gw6=%s\n' "$ENABLED" "$CAMPUS_IFACE" "$CAMPUS_DEV" "$CAMPUS_IFINDEX" "$CAMPUS_GW" "$CAMPUS_GW6"
+		printf 'campus_src4=%s\ncampus_src6=%s\ncampus_online=%s\ncampus_online_reason=%s\ncampus_health_state=%s\ncampus_health_failures=%s\ncampus_health_successes=%s\n' "$CAMPUS_SRC4" "$CAMPUS_SRC6" "$CAMPUS_ONLINE" "$CAMPUS_ONLINE_REASON" "$CAMPUS_HEALTH_STATE" "$CAMPUS_HEALTH_FAILURES" "$CAMPUS_HEALTH_SUCCESSES"
+		printf 'usb_iface=%s\nusb_dev=%s\nusb_ifindex=%s\nusb_gw=%s\nusb_gw6=%s\nusb_online=%s\nusb_online4=%s\nusb_online6=%s\nusb_online_reason=%s\n' "$USB_LOGICAL" "$USB_DEV" "$USB_IFINDEX" "$USB_GW" "$USB_GW6" "$USB_ONLINE" "$USB_ONLINE4" "$USB_ONLINE6" "$USB_ONLINE_REASON"
+		printf 'campus_table=%s\nusb_table=%s\nblock_table=%s\nplugin_compat=%s\nusb_missing_action=%s\nusb_missing_fallback=%s\ncampus_failover=%s\ncampus_healthcheck=%s\ncampus_probe_hosts=%s\nipv6=%s\ngeosite_domains=%s\n' "$CAMPUS_TABLE" "$USB_TABLE" "$BLOCK_TABLE" "$PLUGIN_COMPAT" "$USB_MISSING_ACTION" "$USB_MISSING_FALLBACK" "$CAMPUS_FAILOVER" "$CAMPUS_HEALTHCHECK" "$CAMPUS_PROBE_HOSTS" "$IPV6" "$GEO_DOMAINS"
+		printf 'dataplane_signature=%s\npolicy_signature=%s\nlast_reconcile_action=%s\nfull_rebuilds=%s\npolicy_updates=%s\nhealth_ticks=%s\n' \
+			"$DATA_PLANE_SIGNATURE" "$POLICY_SIGNATURE" "$LAST_RECONCILE_ACTION" "$full" "$policy" "$health"
+	} > "$tmp" && mv -f "$tmp" "$STATE_FILE"
+}
+
+reconcile() {
+	local reconcile_error=0 geosite_error=0 runtime_warning=0 force_full="$1" old_data old_policy need_full=0 previous_geo
+	FORCE_RECLASSIFY=0
+	load_config; acquire_lock || return 0
+	if [ "$ENABLED" -ne 1 ]; then
+		check_backends >/dev/null 2>&1 || true; select_interfaces
+		remove_firewall; remove_routes; remove_sets; rm -f "$DNSMASQ_CONF" "$DATA_SIG_FILE" "$POLICY_SIG_FILE" "$GEOSITE_RETRY_FILE"
+		killall -HUP dnsmasq 2>/dev/null || true
+		record_reconcile_action disabled
+		release_lock; return 0
+	fi
+	check_backends || { release_lock; return 1; }
+	select_interfaces; [ -n "$CAMPUS_DEV" ] || runtime_warning=1
+	choose_tables || { release_lock; return 1; }
+	previous_geo="$(state_get geosite_domains)"; case "$previous_geo" in ''|*[!0-9]*) previous_geo=0 ;; esac; GEO_DOMAINS="$previous_geo"
+	DATA_PLANE_SIGNATURE="$(build_data_signature)"; old_data="$(signature_get "$DATA_SIG_FILE")"
+	if [ "$force_full" = force ] || [ -z "$old_data" ] || [ "$old_data" != "$DATA_PLANE_SIGNATURE" ] || ! data_plane_present; then
+		need_full=1
+	fi
+	if [ "$need_full" -eq 1 ]; then
+		: > "$STATE_DIR/sets"
+		if ! ensure_ipset "$SET4" 4 "$CN4_FILE"; then set_error 'failed to build IPv4 CN ipset'; reconcile_error=1; fi
+		if [ "$IPV6" -eq 1 ]; then
+			if ! ensure_ipset "$SET6" 6 "$CN6_FILE"; then set_error 'failed to build IPv6 CN ipset'; reconcile_error=1; fi
+		else
+			ipset destroy "$SET6" >/dev/null 2>&1 || true
+		fi
+		if ! ensure_geo_ipset "$GEO4" 4; then set_error 'failed to create IPv4 GeoSite ipset'; reconcile_error=1; fi
+		if [ "$IPV6" -eq 1 ]; then
+			if ! ensure_geo_ipset "$GEO6" 6; then set_error 'failed to create IPv6 GeoSite ipset'; reconcile_error=1; fi
+		else
+			ipset destroy "$GEO6" >/dev/null 2>&1 || true
+		fi
+		setup_routes || { set_error 'failed to install policy routes'; release_lock; return 1; }
+		setup_rules || { set_error 'failed to install ip rules'; release_lock; return 1; }
+		# The first/full install still needs a provisional chain so every health
+		# probe is forced through the campus policy table.
+		setup_firewall || { set_error 'failed to install firewall policy'; release_lock; return 1; }
+		update_campus_health
+		setup_firewall || { set_error 'failed to install health-adjusted firewall policy'; release_lock; return 1; }
+		if setup_geosite; then
+			rm -f "$GEOSITE_RETRY_FILE"
+		else
+			set_error 'failed to install GeoSite dnsmasq map'; geosite_error=1; : > "$GEOSITE_RETRY_FILE"
+		fi
+		POLICY_SIGNATURE="$(build_policy_signature)"
+		write_signature "$POLICY_SIG_FILE" "$POLICY_SIGNATURE"
+		# A missing campus link is a supported failover state, not an install
+		# failure. Cache the USB/block data plane so it is not rebuilt each tick.
+		data_plane_present || { set_error 'installed data plane failed validation'; reconcile_error=1; }
+		if [ "$reconcile_error" -eq 0 ]; then
+			write_signature "$DATA_SIG_FILE" "$DATA_PLANE_SIGNATURE"
+			[ "$runtime_warning" -eq 0 ] && [ "$geosite_error" -eq 0 ] && clear_error
+		else
+			rm -f "$DATA_SIG_FILE"
+		fi
+		record_reconcile_action full
+	else
+		# Steady state: perform only the health probe. Route tables, ipsets and
+		# firewall chains remain untouched unless the effective targets change.
+		if [ -f "$GEOSITE_RETRY_FILE" ]; then
+			if setup_geosite; then rm -f "$GEOSITE_RETRY_FILE"; else set_error 'failed to install GeoSite dnsmasq map'; geosite_error=1; fi
+		fi
+		update_campus_health
+		POLICY_SIGNATURE="$(build_policy_signature)"; old_policy="$(signature_get "$POLICY_SIG_FILE")"
+		if [ -z "$old_policy" ] || [ "$old_policy" != "$POLICY_SIGNATURE" ]; then
+			setup_firewall || { set_error 'failed to update health-adjusted firewall policy'; release_lock; return 1; }
+			write_signature "$POLICY_SIG_FILE" "$POLICY_SIGNATURE"
+			record_reconcile_action policy
+		else
+			record_reconcile_action health
+		fi
+		[ "$reconcile_error" -eq 0 ] && [ "$runtime_warning" -eq 0 ] && [ "$geosite_error" -eq 0 ] && clear_error
+	fi
+	write_runtime_state
+	# A transition signature includes FORCE_RECLASSIFY=1. The next steady tick
+	# replaces that temporary chain once, matching the old one-interval window.
+	FORCE_RECLASSIFY=0
+	release_lock; return 0
+}
+teardown() {
+	load_config
+	check_backends >/dev/null 2>&1 || true
+	# Stop/reload can run beside the procd daemon.  Serialize teardown with
+	# reconcile so a stop cannot flush policy tables or chains mid-rebuild.
+	acquire_lock || return 0
+	remove_firewall
+	remove_routes
+	remove_sets
+	rm -f "$DNSMASQ_CONF" "$DATA_SIG_FILE" "$POLICY_SIG_FILE" "$GEOSITE_RETRY_FILE"
+	killall -HUP dnsmasq 2>/dev/null || true
+	release_lock
+}
+status() {
+	load_config; select_interfaces
+	# Status is intentionally read-only. A LuCI poll must not consume a health
+	# transition before reconcile has installed the corresponding firewall.
+	CAMPUS_HEALTH_STATE="$(health_get state)"
+	CAMPUS_HEALTH_FAILURES="$(health_get failures)"
+	CAMPUS_HEALTH_SUCCESSES="$(health_get successes)"
+	case "$CAMPUS_HEALTH_FAILURES" in ''|*[!0-9]*) CAMPUS_HEALTH_FAILURES=0 ;; esac
+	case "$CAMPUS_HEALTH_SUCCESSES" in ''|*[!0-9]*) CAMPUS_HEALTH_SUCCESSES=0 ;; esac
+	case "$CAMPUS_HEALTH_STATE" in online|offline|unknown) ;; *) CAMPUS_HEALTH_STATE=unknown ;; esac
+	if [ "$CAMPUS_LINK_UP" -ne 1 ]; then
+		CAMPUS_ONLINE=0; CAMPUS_HEALTH_STATE=offline; CAMPUS_ONLINE_REASON=interface_unavailable
+	elif [ "$CAMPUS_HEALTH_STATE" = offline ]; then
+		CAMPUS_ONLINE=0; CAMPUS_ONLINE_REASON="$(health_get reason)"; [ -n "$CAMPUS_ONLINE_REASON" ] || CAMPUS_ONLINE_REASON=probe_failed
+	elif [ "$CAMPUS_HEALTH_STATE" = online ]; then
+		CAMPUS_ONLINE=1; CAMPUS_ONLINE_REASON="$(health_get reason)"; [ -n "$CAMPUS_ONLINE_REASON" ] || CAMPUS_ONLINE_REASON=probe_ok
+	fi
+	local err='' updated='never' degraded=1 full_rebuilds=0 policy_updates=0 health_ticks=0 last_action=none
+	[ -f "$STATE_DIR/last_error" ] && err="$(cat "$STATE_DIR/last_error" 2>/dev/null)"
+	full_rebuilds="$(stats_get full_rebuilds)"; policy_updates="$(stats_get policy_updates)"; health_ticks="$(stats_get health_ticks)"; last_action="$(stats_get last_action)"
+	case "$full_rebuilds" in ''|*[!0-9]*) full_rebuilds=0 ;; esac
+	case "$policy_updates" in ''|*[!0-9]*) policy_updates=0 ;; esac
+	case "$health_ticks" in ''|*[!0-9]*) health_ticks=0 ;; esac
+	[ -n "$last_action" ] || last_action=none
+	[ -f /etc/campus-route/rules.state ] && updated="$(awk -F= '$1=="updated" {print substr($0,index($0,"=")+1); exit}' /etc/campus-route/rules.state 2>/dev/null)"; [ -f /etc/campus-route/rules.state ] && degraded="$(awk -F= '$1=="degraded" {print $2; exit}' /etc/campus-route/rules.state 2>/dev/null)"
+	local c4=0 c6=0
+	[ -n "$IPT4" ] && c4="$("$IPT4" -t mangle -L "$MANGLE_CHAIN" -v -n 2>/dev/null | awk 'NR>2 {p+=$1; b+=$2} END {printf "%s/%s", p+0, b+0}')"
+	[ "$IPV6" -eq 1 ] && [ -n "$IPT6" ] && c6="$("$IPT6" -t mangle -L "$MANGLE_CHAIN" -v -n 2>/dev/null | awk 'NR>2 {p+=$1; b+=$2} END {printf "%s/%s", p+0, b+0}')"
+	printf '{"enabled":%s,"campus_iface":"%s","campus_dev":"%s","campus_ifindex":"%s","campus_gateway":"%s","campus_gateway6":"%s","campus_online":%s,"campus_online_reason":"%s","campus_health_state":"%s","campus_health_failures":%s,"campus_health_successes":%s,"campus_failover":%s,"campus_healthcheck":%s,"campus_probe_hosts":"%s","usb_iface":"%s","usb_dev":"%s","usb_ifindex":"%s","usb_gateway":"%s","usb_gateway6":"%s","usb_online":%s,"usb_online4":%s,"usb_online6":%s,"usb_online_reason":"%s","usb_missing_action":"%s","usb_missing_fallback":%s,"plugin_compat":%s,"ipv6":%s,"unknown_policy":"%s","domestic_precedence":%s,"geosite_domains":%s,"campus_table":"%s","usb_table":"%s","block_table":"%s","rules_updated":"%s","rules_degraded":%s,"ipv4_counters":"%s","ipv6_counters":"%s","reconcile_last_action":"%s","reconcile_full_rebuilds":%s,"reconcile_policy_updates":%s,"reconcile_health_ticks":%s,"last_error":"%s"}\n' "$ENABLED" "$CAMPUS_IFACE" "$CAMPUS_DEV" "$CAMPUS_IFINDEX" "$CAMPUS_GW" "$CAMPUS_GW6" "$CAMPUS_ONLINE" "$CAMPUS_ONLINE_REASON" "$CAMPUS_HEALTH_STATE" "$CAMPUS_HEALTH_FAILURES" "$CAMPUS_HEALTH_SUCCESSES" "$CAMPUS_FAILOVER" "$CAMPUS_HEALTHCHECK" "$CAMPUS_PROBE_HOSTS" "$USB_LOGICAL" "$USB_DEV" "$USB_IFINDEX" "$USB_GW" "$USB_GW6" "$USB_ONLINE" "$USB_ONLINE4" "$USB_ONLINE6" "$USB_ONLINE_REASON" "$USB_MISSING_ACTION" "$USB_MISSING_FALLBACK" "$PLUGIN_COMPAT" "$IPV6" "$UNKNOWN_POLICY" "$DOMESTIC_PRECEDENCE" "$GEO_DOMAINS" "$(state_get campus_table)" "$(state_get usb_table)" "$(state_get block_table)" "$updated" "$degraded" "$c4" "$c6" "$last_action" "$full_rebuilds" "$policy_updates" "$health_ticks" "$(printf '%s' "$err" | sed 's/"/\\"/g')"
+}
+daemon_loop() {
+	local last_enabled=unknown
+	trap 'teardown; exit 0' TERM INT
+	while :; do
+		load_config
+		if [ "$ENABLED" -eq 1 ]; then
+			reconcile
+		elif [ "$last_enabled" != 0 ]; then
+			# Do cleanup once on a disable transition, not every 30 seconds.
+			teardown
+		fi
+		last_enabled="$ENABLED"
+		sleep "$RECONCILE_INTERVAL"
+	done
+}
+snapshot() {
+	local base="$1" stamp dir; stamp="$(date -u '+%Y%m%dT%H%M%SZ' 2>/dev/null || date '+%Y%m%d%H%M%S')"; dir="$base"; [ -n "$dir" ] || dir="/etc/campus-route/snapshots/$stamp"; mkdir -p "$dir" || return 1
+	[ -f /etc/config/campus_route ] && cp -p /etc/config/campus_route "$dir/campus_route.uci"; [ -n "$IPT4" ] && "$IPT4" -t mangle -S > "$dir/iptables-mangle.save" 2>/dev/null; [ -n "$IPT4" ] && "$IPT4" -t filter -S > "$dir/iptables-filter.save" 2>/dev/null; [ "$IPV6" -eq 1 ] && [ -n "$IPT6" ] && { "$IPT6" -t mangle -S > "$dir/ip6tables-mangle.save" 2>/dev/null; "$IPT6" -t filter -S > "$dir/ip6tables-filter.save" 2>/dev/null; }; ipset save > "$dir/ipset.save" 2>/dev/null; ip -4 rule show > "$dir/ip-rule4.save" 2>/dev/null; ip -4 route show table all > "$dir/ip-route4.save" 2>/dev/null; [ "$IPV6" -eq 1 ] && { ip -6 rule show > "$dir/ip-rule6.save" 2>/dev/null; ip -6 route show table all > "$dir/ip-route6.save" 2>/dev/null; }; printf 'created=%s\npath=%s\n' "$stamp" "$dir" > "$dir/manifest"; printf '%s\n' "$dir"
+	for section in network firewall dhcp system openclash passwall; do uci -q export "$section" > "$dir/uci-$section.export" 2>/dev/null || true; done
+	for f in /etc/config/network /etc/config/firewall /etc/config/dhcp /etc/config/system /etc/config/openclash /etc/config/passwall /etc/firewall.user /etc/iproute2/rt_tables; do [ -f "$f" ] || continue; cp -p "$f" "$dir/$(echo "$f" | sed 's#^/##; s#/#__#g')" 2>/dev/null || true; done
+	find /var/etc/openclash /var/etc/passwall -maxdepth 2 -type f -print 2>/dev/null | sort > "$dir/plugin-files.list" || true
+	chmod 0700 "$dir"
+}
+case "$1" in start|restart|reload|reconcile) reconcile; exit $? ;; rebuild|--rebuild) reconcile force; exit $? ;; stop) teardown; exit $? ;; daemon|--daemon) daemon_loop ;; status|--status) status; exit 0 ;; refresh|--refresh) /usr/bin/campus-route-update --force && reconcile; exit $? ;; snapshot|--snapshot) load_config; check_backends >/dev/null 2>&1 || true; snapshot "$2"; exit $? ;; *) printf '%s\n' "Usage: $0 {start|stop|restart|reconcile|rebuild|daemon|status|refresh|snapshot}" >&2; exit 2 ;; esac

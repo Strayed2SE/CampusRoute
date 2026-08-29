@@ -1,0 +1,3 @@
+# Populated by campus-route-update from a trusted CN CIDR source.
+# This staged fixture is intentionally empty; install.sh never overwrites a
+# pre-existing cache.

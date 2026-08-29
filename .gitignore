@@ -1,0 +1,24 @@
+# Local credentials and device state
+*.local
+*.secret
+*.secrets
+.env
+.env.*
+config.local.json
+etc/config/drcom.local
+**/snapshots/
+**/*.capture
+**/*.pcap
+**/*.log
+
+# Build and Python cache
+__pycache__/
+*.py[cod]
+build/
+dist/
+.pytest_cache/
+
+# Local release staging
+outputs/
+work/
+private_repo/

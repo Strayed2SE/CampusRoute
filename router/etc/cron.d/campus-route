@@ -1,0 +1,10 @@
+# Weekly low-traffic rule refresh.  OpenWrt crond also accepts this file when
+# /etc/cron.d is enabled; install.sh mirrors the line into crontabs/root.
+# Honour the WebUI rule_refresh selector: manual mode never performs an
+# unattended download.  Keep the command fixed (no shell input is accepted).
+17 4 * * 0 uci -q get campus_route.main.rule_refresh 2>/dev/null | grep -qx weekly && /usr/bin/campus-route refresh >/dev/null 2>&1
+# Safety-net health reconcile once per minute. The procd daemon normally runs
+# every 30 seconds; unchanged state takes the health-only path, so this no
+# longer flushes routes/ipsets/chains. It still detects a scheduled cutoff if
+# the daemon was briefly restarted or delayed by a firewall reload.
+* * * * * uci -q get campus_route.main.enabled 2>/dev/null | grep -qx 1 && /usr/bin/campus-route reconcile >/dev/null 2>&1

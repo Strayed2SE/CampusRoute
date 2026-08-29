@@ -1,0 +1,8 @@
+#!/bin/sh
+# Reconcile policy routes after any logical interface transition.  The main
+# script re-detects wanusb/wwan, so this remains valid across USB hot-plug.
+
+[ "$ACTION" = ifup ] || [ "$ACTION" = ifdown ] || [ "$ACTION" = ifupdate ] || exit 0
+logger -t campus-route "interface $INTERFACE $ACTION; scheduling reconcile" 2>/dev/null
+/usr/bin/campus-route reconcile >/dev/null 2>&1 &
+exit 0

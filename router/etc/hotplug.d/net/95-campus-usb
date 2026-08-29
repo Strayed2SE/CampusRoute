@@ -1,0 +1,13 @@
+#!/bin/sh
+# Start the single USB tether interface when a real USB-backed usb0 appears.
+# This deliberately ignores virtual/test devices and never changes LAN state.
+[ "$ACTION" = add ] || exit 0
+DEV="${INTERFACE:-${DEVICE:-}}"
+[ "$DEV" = usb0 ] || exit 0
+case "$(readlink -f "/sys/class/net/$DEV/device" 2>/dev/null)" in
+  */usb*/*) ;;
+  *) exit 0 ;;
+esac
+logger -t campus-usb "USB net device $DEV added; starting wanusb" 2>/dev/null
+ubus call network.interface.wanusb up >/dev/null 2>&1 || ifup wanusb >/dev/null 2>&1
+exit 0

@@ -1,0 +1,289 @@
+#!/bin/sh
+# Campus Route rule cache updater. Downloads plain CIDR files atomically and
+# keeps the last-known-good cache if a source, certificate, or parser fails.
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+CONFIG=campus_route
+RULE_DIR=/etc/campus-route/rules
+STATE_FILE=/etc/campus-route/rules.state
+LOGTAG=campus-route-update
+TIMEOUT=30
+FORCE=0
+
+mkdir -p "$RULE_DIR" /etc/campus-route 2>/dev/null
+
+cfg() {
+	uci -q get "$CONFIG.main.$1" 2>/dev/null
+}
+
+log_msg() {
+	logger -t "$LOGTAG" "$*" 2>/dev/null
+}
+
+fetch_url() {
+	local url="$1" out="$2" insecure
+	insecure="$(cfg insecure_fetch)"
+	case "$insecure" in 1|yes|true|on) insecure=1 ;; *) insecure=0 ;; esac
+	if command -v uclient-fetch >/dev/null 2>&1; then
+		if [ "$insecure" -eq 1 ]; then
+			uclient-fetch -q --no-check-certificate --timeout "$TIMEOUT" -O "$out" "$url" >/dev/null 2>&1
+		else
+			uclient-fetch -q --timeout "$TIMEOUT" -O "$out" "$url" >/dev/null 2>&1
+		fi
+		return $?
+	fi
+	if command -v curl >/dev/null 2>&1; then
+		if [ "$insecure" -eq 1 ]; then
+			curl -fsSLk --connect-timeout "$TIMEOUT" --max-time "$TIMEOUT" -o "$out" "$url" >/dev/null 2>&1
+		else
+			curl -fsSL --connect-timeout "$TIMEOUT" --max-time "$TIMEOUT" -o "$out" "$url" >/dev/null 2>&1
+		fi
+		return $?
+	fi
+	if command -v wget >/dev/null 2>&1; then
+		if [ "$insecure" -eq 1 ]; then
+			wget -q --no-check-certificate -T "$TIMEOUT" -O "$out" "$url" >/dev/null 2>&1
+		else
+			wget -q -T "$TIMEOUT" -O "$out" "$url" >/dev/null 2>&1
+		fi
+		return $?
+	fi
+	return 127
+}
+
+strip_line() {
+	local line="$1"
+	line="${line%%#*}"
+	line="$(printf '%s' "$line" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+	printf '%s' "$line"
+}
+
+valid_v4() {
+	printf '%s\n' "$1" | awk -F/ '
+		BEGIN { ok=1 }
+		{ if (NF != 2 || $1 !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || $2 !~ /^[0-9]+$/ || $2 > 32) ok=0; else { n=split($1,a,"."); for(i=1;i<=n;i++) if(a[i] < 0 || a[i] > 255) ok=0 } }
+		END { exit(ok ? 0 : 1) }
+	'
+}
+
+valid_v6() {
+	printf '%s\n' "$1" | awk -F/ '
+		BEGIN { ok=1 }
+		{ if (NF != 2 || $2 !~ /^[0-9]+$/ || $2 > 128 || $1 !~ /^[0-9A-Fa-f:.]+$/ || index($1, ":") == 0) ok=0 }
+		END { exit(ok ? 0 : 1) }
+	'
+}
+
+sanitize() {
+	local src="$1" dst="$2" family="$3" line good=0 total=0
+	: > "$dst" || return 1
+	while IFS= read -r line || [ -n "$line" ]; do
+		line="$(strip_line "$line")"
+		[ -n "$line" ] || continue
+		total=$((total + 1))
+		if [ "$family" = 4 ]; then
+			valid_v4 "$line" || continue
+		else
+			valid_v6 "$line" || continue
+		fi
+		printf '%s\n' "$line" >> "$dst"
+		good=$((good + 1))
+	done < "$src"
+	[ "$good" -gt 0 ] || return 1
+	printf '%s\n' "$good"
+}
+
+find_plugin_file() {
+	local family="$1" candidate base
+	if [ "$family" = 4 ]; then
+		for candidate in \
+			/etc/openclash/*.txt /etc/openclash/*.list /var/etc/openclash/*.txt \
+			/var/etc/openclash/*.list /etc/passwall/*cn*.txt /usr/share/passwall/*cn*.txt; do
+				[ -f "$candidate" ] || continue
+				base="$(basename "$candidate")"
+				case "$base" in *cn*|*china*|*China*) printf '%s\n' "$candidate"; return 0 ;; esac
+		done
+	else
+		for candidate in \
+			/etc/openclash/*6*.txt /etc/openclash/*6*.list /var/etc/openclash/*6*.txt \
+			/var/etc/openclash/*6*.list /etc/passwall/*6*.txt /usr/share/passwall/*6*.txt; do
+				[ -f "$candidate" ] || continue
+				printf '%s\n' "$candidate"; return 0
+		done
+	fi
+	return 1
+}
+
+install_one() {
+	local name="$1" family="$2" source="$3" destination="$4" tmp raw count plugin sha expected
+	tmp="$RULE_DIR/.${name}.tmp.$$"
+	raw="$RULE_DIR/.${name}.raw.$$"
+	mkdir -p "$(dirname "$destination")" || return 1
+	# Plugin-generated plain files are the preferred source.  When a plugin
+	# cache is present but not parseable (for example a binary database), fall
+	# back to the configured text source before retaining last-known-good data.
+	plugin="$(find_plugin_file "$family" 2>/dev/null)"
+	count=""
+	if [ -n "$plugin" ]; then
+		raw="$plugin"
+		count="$(sanitize "$raw" "$tmp" "$family" 2>/dev/null)" || count=""
+	fi
+	if [ -z "$count" ]; then
+		rm -f "$tmp"
+		[ -n "$source" ] || {
+			[ -s "$destination" ] && { log_msg "$name has no usable source; keeping previous cache"; printf '%s\n' keep; return 0; }
+			log_msg "$name has no usable source and no previous cache"
+			return 1
+		}
+		raw="$RULE_DIR/.${name}.raw.$$"
+		fetch_url "$source" "$raw" || {
+			rm -f "$raw" "$tmp"
+			[ -s "$destination" ] && { log_msg "$name download failed; keeping previous cache"; printf '%s\n' keep; return 0; }
+			log_msg "$name download failed and no cache exists"
+			return 1
+		}
+		count="$(sanitize "$raw" "$tmp" "$family" 2>/dev/null)" || {
+			rm -f "$raw" "$tmp"
+			log_msg "$name validation failed; keeping previous cache"
+			return 1
+		}
+	fi
+	sha="$(cfg ${name}_sha256)"
+	if [ -n "$sha" ] && command -v sha256sum >/dev/null 2>&1; then
+		expected="$(printf '%s' "$sha" | tr 'A-F' 'a-f')"
+		[ "$(sha256sum "$tmp" | awk '{print $1}')" = "$expected" ] || {
+			[ "$raw" != "$plugin" ] && rm -f "$raw"; rm -f "$tmp"
+			log_msg "$name checksum mismatch; keeping previous cache"
+			return 1
+		}
+	fi
+	mv -f "$tmp" "$destination" || {
+		[ "$raw" != "$plugin" ] && rm -f "$raw"; rm -f "$tmp"; return 1
+	}
+	[ "$raw" != "$plugin" ] && rm -f "$raw"
+	printf '%s\n' "$count"
+	return 0
+}
+
+parse_geosite() {
+	local raw="$1" tmp="$2" line count
+	: > "$tmp" || return 1
+	while IFS= read -r line || [ -n "$line" ]; do
+		line="$(strip_line "$line")"
+		[ -n "$line" ] || continue
+		case "$line" in
+			domain:*|full:*|regexp:*|\|\|*|[A-Za-z0-9]*.*)
+				printf '%s\n' "$line" >> "$tmp" ;;
+		esac
+	done < "$raw"
+	# Count only actionable domain records, not comments/blank metadata.
+	count="$(awk '
+		/^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+		/^domain:/ || /^full:/ || /^regexp:/ || /^\|\|/ || /^[A-Za-z0-9][A-Za-z0-9._-]*\.[A-Za-z]{2,}$/ { n++ }
+		END { print n+0 }
+	' "$tmp" 2>/dev/null)"
+	[ "$count" -gt 0 ] || return 1
+	printf '%s\n' "$count"
+}
+
+update_geosite() {
+	local source="$1" destination tmp raw plugin count sha expected
+	destination="$(cfg geosite_file)"; [ -n "$destination" ] || destination="$RULE_DIR/geosite-cn.txt"
+	mkdir -p "$(dirname "$destination")" || return 1
+	plugin=""
+	# Only consume textual GeoSite exports.  Binary .db/.dat files are not
+	# line-oriented and must not replace a good text cache.
+	for raw in /etc/openclash/*geosite*.txt /etc/openclash/*geosite*.list \
+		/var/etc/openclash/*geosite*.txt /var/etc/openclash/*geosite*.list \
+		/etc/passwall/*geosite*.txt /etc/passwall/*geosite*.list \
+		/usr/share/passwall/*geosite*.txt /usr/share/passwall/*geosite*.list; do
+		[ -f "$raw" ] || continue
+		plugin="$raw"; break
+	done
+	if [ -z "$plugin" ] && [ -z "$source" ]; then
+		[ -s "$destination" ] && return 0
+		return 1
+	fi
+	tmp="$RULE_DIR/.geosite.tmp.$$"
+	raw="$plugin"
+	count=""
+	[ -n "$raw" ] && count="$(parse_geosite "$raw" "$tmp" 2>/dev/null)" || count=""
+	# A malformed/binary plugin export falls back to the configured text source.
+	if [ -z "$count" ] && [ -n "$source" ]; then
+		rm -f "$tmp"
+		raw="$RULE_DIR/.geosite.raw.$$"
+		fetch_url "$source" "$raw" || { rm -f "$raw"; [ -s "$destination" ] && { log_msg 'geosite download failed; keeping previous cache'; return 0; }; return 1; }
+		count="$(parse_geosite "$raw" "$tmp" 2>/dev/null)" || count=""
+	fi
+	[ -n "$count" ] || { [ "$raw" != "$plugin" ] && rm -f "$raw"; rm -f "$tmp"; [ -s "$destination" ] && { log_msg 'geosite validation failed; keeping previous cache'; return 0; }; return 1; }
+	sha="$(cfg geosite_sha256)"
+	if [ -n "$sha" ] && command -v sha256sum >/dev/null 2>&1; then
+		expected="$(printf '%s' "$sha" | tr 'A-F' 'a-f')"
+		[ "$(sha256sum "$tmp" | awk '{print $1}')" = "$expected" ] || { [ "$raw" != "$plugin" ] && rm -f "$raw"; rm -f "$tmp"; log_msg 'geosite checksum mismatch; keeping previous cache'; return 1; }
+	fi
+	mv -f "$tmp" "$destination" || { [ "$raw" != "$plugin" ] && rm -f "$raw"; rm -f "$tmp"; return 1; }
+	[ "$raw" != "$plugin" ] && rm -f "$raw"
+	return 0
+}
+
+write_state() {
+	local r4="$1" r6="$2" rg="$3" source4="$4" source6="$5" sourceg="$6"
+	local c4=0 c6=0 cg=0 geofile cn4file cn6file
+	cn4file="$(cfg cn4_file)"; [ -n "$cn4file" ] || cn4file="$RULE_DIR/cn4.txt"
+	cn6file="$(cfg cn6_file)"; [ -n "$cn6file" ] || cn6file="$RULE_DIR/cn6.txt"
+	geofile="$(cfg geosite_file)"; [ -n "$geofile" ] || geofile="$RULE_DIR/geosite-cn.txt"
+	# Count only usable records so comment-only staged fixtures are reported as
+	# degraded instead of falsely appearing healthy.
+	[ -f "$cn4file" ] && c4="$(awk '
+		/^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+		/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+([[:space:]]|$)/ { n++ }
+		END { print n+0 }
+	' "$cn4file" 2>/dev/null)"
+	[ -f "$cn6file" ] && c6="$(awk '
+		/^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+		/^[0-9A-Fa-f:.]+\/[0-9]+([[:space:]]|$)/ { n++ }
+		END { print n+0 }
+	' "$cn6file" 2>/dev/null)"
+	[ -f "$geofile" ] && cg="$(awk '
+		/^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+		/^domain:/ || /^full:/ || /^regexp:/ || /^\|\|/ || /^[A-Za-z0-9][A-Za-z0-9._-]*\.[A-Za-z]{2,}$/ { n++ }
+		END { print n+0 }
+	' "$geofile" 2>/dev/null)"
+	{
+		printf 'updated=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)"
+		printf 'cn4_count=%s\ncn6_count=%s\ngeosite_count=%s\n' "$c4" "$c6" "$cg"
+		printf 'cn4_result=%s\ncn6_result=%s\ngeosite_result=%s\n' "$r4" "$r6" "$rg"
+		printf 'cn4_source=%s\ncn6_source=%s\ngeosite_source=%s\n' "$source4" "$source6" "$sourceg"
+		printf 'cn4_version=%s\ncn6_version=%s\ngeosite_version=%s\nrules_license=%s\n' "$(cfg cn4_version)" "$(cfg cn6_version)" "$(cfg geosite_version)" "$(cfg rules_license)"
+		[ "$cg" -gt 0 ] || printf 'degraded=1\n'
+		[ "$cg" -gt 0 ] && printf 'degraded=0\n'
+	} > "$STATE_FILE.tmp.$$" && mv -f "$STATE_FILE.tmp.$$" "$STATE_FILE"
+}
+
+show_status() {
+	[ -f "$STATE_FILE" ] && cat "$STATE_FILE" || printf '%s\n' 'updated=never'
+}
+
+main() {
+	case "$1" in --force|-f) FORCE=1; shift ;; esac
+	case "$1" in
+		status|--status) show_status; return 0 ;;
+		'') : ;;
+		update|--update|--force|-f) : ;;
+		*) printf '%s\n' "Usage: $0 [update|status|--force]" >&2; return 2 ;;
+	esac
+	TIMEOUT="$(cfg update_timeout)"; case "$TIMEOUT" in ''|*[!0-9]*) TIMEOUT=30 ;; esac
+	local source4 source6 sourceg dest4 dest6 r4 r6 rg
+	source4="$(cfg cn4_source)"; source6="$(cfg cn6_source)"; sourceg="$(cfg geosite_source)"
+	dest4="$(cfg cn4_file)"; [ -n "$dest4" ] || dest4="$RULE_DIR/cn4.txt"
+	dest6="$(cfg cn6_file)"; [ -n "$dest6" ] || dest6="$RULE_DIR/cn6.txt"
+	r4="$(install_one cn4 4 "$source4" "$dest4" 2>/dev/null || printf '%s' failed)"
+	r6="$(install_one cn6 6 "$source6" "$dest6" 2>/dev/null || printf '%s' failed)"
+	if update_geosite "$sourceg" 2>/dev/null; then rg=ok; else rg=failed; fi
+	write_state "$r4" "$r6" "$rg" "$source4" "$source6" "$sourceg"
+	[ "$r4" != failed ] || [ -s "$dest4" ] || return 1
+	[ "$r6" != failed ] || [ -s "$dest6" ] || return 1
+	return 0
+}
+
+main "$@"

@@ -1,0 +1,199 @@
+#!/bin/sh
+# Dr.COM automatic authentication for QWRT/OpenWrt.
+# Configuration: /etc/config/drcom (UCI section "main").
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+CONFIG=/etc/config/drcom
+LOCKDIR=/var/run/drcom-auto-login.lock
+LOGFILE=/var/log/drcom-auto.log
+LOGTAG=drcom-auto
+
+log_msg() {
+	local msg="$1"
+	local line
+	line="$(date '+%F %T') $msg"
+	logger -t "$LOGTAG" "$msg" 2>/dev/null
+	printf '%s\n' "$line" >> "$LOGFILE" 2>/dev/null
+	if [ -f "$LOGFILE" ] && [ "$(wc -c < "$LOGFILE" 2>/dev/null)" -gt 131072 ]; then
+		tail -n 400 "$LOGFILE" > "$LOGFILE.tmp" 2>/dev/null && mv -f "$LOGFILE.tmp" "$LOGFILE"
+	fi
+}
+
+load_config() {
+	. /lib/functions.sh
+	config_load drcom
+	config_get_bool ENABLED main enabled 1
+	config_get PORTAL_HOST main portal_host "PORTAL_HOST"
+	config_get LOGIN_PATH main login_path "/drcom/login"
+	config_get STATUS_PATH main status_path "/drcom/chkstatus"
+	config_get USERNAME main username ""
+	config_get PASSWORD main password ""
+	config_get CALLBACK main callback "dr1003"
+	config_get MKKEY main mkkey "123456"
+	config_get R1 main r1 "0"
+	config_get R2 main r2 ""
+	config_get R3 main r3 "0"
+	config_get R6 main r6 "1"
+	config_get PARA main para "00"
+	config_get V6IP main v6ip ""
+	config_get TERMINAL_TYPE main terminal_type "2"
+	config_get LANG main lang "zh-cn"
+	config_get JS_VERSION main js_version "4.2.1"
+	config_get VERSION main version "1224"
+	config_get INTERVAL main interval "60"
+	config_get TIMEOUT main timeout "10"
+}
+
+acquire_lock() {
+	if mkdir "$LOCKDIR" 2>/dev/null; then
+		printf '%s\n' "$$" > "$LOCKDIR/pid"
+		return 0
+	fi
+	local pid="$(cat "$LOCKDIR/pid" 2>/dev/null)"
+	if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+		return 1
+	fi
+	rm -rf "$LOCKDIR" 2>/dev/null
+	if mkdir "$LOCKDIR" 2>/dev/null; then
+		printf '%s\n' "$$" > "$LOCKDIR/pid"
+		return 0
+	fi
+	return 1
+}
+
+release_lock() {
+	rm -rf "$LOCKDIR" 2>/dev/null
+}
+
+extract_result() {
+	printf '%s' "$1" | grep -o '"result":[0-9]*' | head -n 1 | cut -d: -f2
+}
+
+extract_message() {
+	printf '%s' "$1" | grep -o '"msga":"[^"]*"' | head -n 1 | sed 's/^"msga":"//; s/"$//'
+}
+
+status_request() {
+	local response result
+	response="$(curl -sS --connect-timeout "$TIMEOUT" --max-time "$TIMEOUT" \
+		"http://$PORTAL_HOST$STATUS_PATH?callback=$CALLBACK" 2>/dev/null)"
+	[ -n "$response" ] || return 2
+	result="$(extract_result "$response")"
+	[ "$result" = "1" ]
+}
+
+login_request() {
+	local response result msg
+	response="$(curl -sS --get --connect-timeout "$TIMEOUT" --max-time "$TIMEOUT" \
+		--data-urlencode "callback=$CALLBACK" \
+		--data-urlencode "DDDDD=$USERNAME" \
+		--data-urlencode "upass=$PASSWORD" \
+		--data-urlencode "0MKKey=$MKKEY" \
+		--data-urlencode "R1=$R1" \
+		--data-urlencode "R2=$R2" \
+		--data-urlencode "R3=$R3" \
+		--data-urlencode "R6=$R6" \
+		--data-urlencode "para=$PARA" \
+		--data-urlencode "v6ip=$V6IP" \
+		--data-urlencode "terminal_type=$TERMINAL_TYPE" \
+		--data-urlencode "lang=$LANG" \
+		--data-urlencode "jsVersion=$JS_VERSION" \
+		--data-urlencode "v=$VERSION" \
+		--data-urlencode "lang=zh" \
+		"http://$PORTAL_HOST$LOGIN_PATH" 2>/dev/null)"
+	[ -n "$response" ] || {
+		log_msg "login request failed: empty response"
+		return 2
+	}
+	result="$(extract_result "$response")"
+	msg="$(extract_message "$response")"
+	case "$result" in
+		1)
+			sleep 1
+			if status_request; then
+				log_msg "login succeeded"
+				return 0
+			fi
+			log_msg "login returned result=1 but status check failed"
+			return 1
+			;;
+		0)
+			[ -n "$msg" ] && log_msg "login rejected: result=0 msg=$msg" || log_msg "login rejected: result=0"
+			return 1
+			;;
+		*)
+			log_msg "login returned an unrecognized response"
+			return 1
+			;;
+	esac
+}
+
+run_once() {
+	load_config
+	[ "$ENABLED" -eq 1 ] || return 0
+	[ -n "$USERNAME" ] && [ -n "$PASSWORD" ] || {
+		log_msg "credentials are not configured"
+		return 2
+	}
+	acquire_lock || return 0
+	if status_request; then
+		log_msg "already online"
+		release_lock
+		return 0
+	fi
+	login_request
+	local rc=$?
+	release_lock
+	return $rc
+}
+
+print_status() {
+	load_config
+	if [ "$ENABLED" -ne 1 ]; then
+		printf '%s\n' "DISABLED"
+		return 0
+	fi
+	if status_request; then
+		printf '%s\n' "ONLINE"
+		return 0
+	fi
+	printf '%s\n' "OFFLINE"
+	return 1
+}
+
+daemon_loop() {
+	while :; do
+		load_config
+		if [ "$ENABLED" -eq 1 ]; then
+			run_once
+		fi
+		case "$INTERVAL" in
+			''|*[!0-9]*) INTERVAL=60 ;;
+		esac
+		[ "$INTERVAL" -lt 15 ] 2>/dev/null && INTERVAL=15
+		sleep "$INTERVAL"
+	done
+}
+
+case "$1" in
+	--once|once)
+		run_once
+		exit $?
+		;;
+	--login|login|--force)
+		run_once
+		exit $?
+		;;
+	--status|status)
+		print_status
+		exit $?
+		;;
+	--daemon|daemon)
+		daemon_loop
+		;;
+	*)
+		printf '%s\n' "Usage: $0 --once|--login|--status|--daemon" >&2
+		exit 2
+		;;
+esac
+

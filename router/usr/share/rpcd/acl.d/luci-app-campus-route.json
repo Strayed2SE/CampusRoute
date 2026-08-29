@@ -1,0 +1,18 @@
+{
+	"luci-app-campus-route": {
+		"description": "Campus Route fixed status/apply/refresh/start/stop RPC and UCI access",
+		"read": {
+			"uci": [ "campus_route" ]
+		},
+		"write": {
+			"uci": [ "campus_route" ]
+		},
+		"exec": {
+			"/usr/bin/campus-route status": [ "exec" ],
+			"/usr/bin/campus-route reconcile": [ "exec" ],
+			"/usr/bin/campus-route refresh": [ "exec" ],
+			"/etc/init.d/campus-route start": [ "exec" ],
+			"/etc/init.d/campus-route stop": [ "exec" ]
+		}
+	}
+}
