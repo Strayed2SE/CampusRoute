@@ -640,6 +640,7 @@ ensure_geo_ipset() {
 remove_jump() { local cmd="$1" table="$2" chain="$3" target="$4" n=0; while [ "$n" -lt 16 ]; do "$cmd" -t "$table" -D "$chain" -j "$target" >/dev/null 2>&1 || break; n=$((n + 1)); done; }
 remove_chain() { local cmd="$1" table="$2" chain="$3"; remove_jump "$cmd" "$table" PREROUTING "$chain"; remove_jump "$cmd" "$table" OUTPUT "$chain"; remove_jump "$cmd" "$table" FORWARD "$chain"; "$cmd" -t "$table" -F "$chain" >/dev/null 2>&1; "$cmd" -t "$table" -X "$chain" >/dev/null 2>&1; }
 remove_accel_parent_jump() { local cmd="$1" parent="$2" target="$3" n=0; [ -n "$cmd" ] || return 0; while [ "$n" -lt 16 ]; do "$cmd" -t mangle -D "$parent" -j "$target" >/dev/null 2>&1 || break; n=$((n + 1)); done; }
+remove_accel_child_jump() { local cmd="$1" parent="$2" target="$3" n=0; [ -n "$cmd" ] || return 0; while [ "$n" -lt 16 ]; do "$cmd" -t mangle -D "$parent" -j "$target" >/dev/null 2>&1 || break; n=$((n + 1)); done; }
 remove_accel_chain() { local cmd="$1" chain="$2"; [ -n "$cmd" ] || return 0; remove_accel_parent_jump "$cmd" PREROUTING "$chain"; remove_accel_parent_jump "$cmd" OUTPUT "$chain"; remove_accel_parent_jump "$cmd" POSTROUTING "$chain"; "$cmd" -t mangle -F "$chain" >/dev/null 2>&1; "$cmd" -t mangle -X "$chain" >/dev/null 2>&1; }
 save_mark_return_chain() { local cmd="$1" chain="$2" mark="$3"; "$cmd" -t mangle -A "$chain" -m mark --mark "$mark/$MASK" -j CONNMARK --save-mark --nfmask "$MASK" --ctmask "$MASK" >/dev/null 2>&1; "$cmd" -t mangle -A "$chain" -m mark --mark "$mark/$MASK" -j RETURN >/dev/null 2>&1; }
 save_mark_return() { local cmd="$1" mark="$2"; "$cmd" -t mangle -A "$MANGLE_CHAIN" -m mark --mark "$mark/$MASK" -j CONNMARK --save-mark --nfmask "$MASK" --ctmask "$MASK" >/dev/null 2>&1; "$cmd" -t mangle -A "$MANGLE_CHAIN" -m mark --mark "$mark/$MASK" -j RETURN >/dev/null 2>&1; }
@@ -666,6 +667,7 @@ add_policy_rules() {
 	# exclusions above, and is removed completely when acceleration is inactive.
 	remove_accel_parent_jump "$cmd" "$MANGLE_CHAIN" "$ACCEL_SELECT_CHAIN"
 	remove_accel_parent_jump "$cmd" "$MANGLE_CHAIN" "$ACCEL_SELECTED_CHAIN"
+	remove_accel_child_jump "$cmd" "$ACCEL_SELECT_CHAIN" "$ACCEL_SELECTED_CHAIN"
 	"$cmd" -t mangle -F "$ACCEL_SELECT_CHAIN" >/dev/null 2>&1; "$cmd" -t mangle -X "$ACCEL_SELECT_CHAIN" >/dev/null 2>&1
 	"$cmd" -t mangle -F "$ACCEL_SELECTED_CHAIN" >/dev/null 2>&1; "$cmd" -t mangle -X "$ACCEL_SELECTED_CHAIN" >/dev/null 2>&1
 	"$cmd" -t mangle -A "$MANGLE_CHAIN" -j CONNMARK --restore-mark --nfmask "$restore_mask" --ctmask "$restore_mask" >/dev/null 2>&1
@@ -1000,11 +1002,13 @@ setup_geosite() {
 remove_firewall() {
 	remove_accel_parent_jump "$IPT4" "$MANGLE_CHAIN" "$ACCEL_SELECT_CHAIN"; remove_accel_parent_jump "$IPT4" "$MANGLE_CHAIN" "$ACCEL_NEW_CHAIN"
 	remove_accel_parent_jump "$IPT4" "$MANGLE_CHAIN" "$ACCEL_SELECTED_CHAIN"
+	remove_accel_child_jump "$IPT4" "$ACCEL_SELECT_CHAIN" "$ACCEL_SELECTED_CHAIN"
 	remove_accel_chain "$IPT4" "$ACCEL_DOWN_CHAIN"; remove_accel_chain "$IPT4" "$ACCEL_UP_CHAIN"; remove_accel_chain "$IPT4" "$ACCEL_LOCAL_CHAIN"; remove_accel_chain "$IPT4" "$ACCEL_MOVED_CHAIN"; remove_accel_chain "$IPT4" "$ACCEL_SELECT_CHAIN"; remove_accel_chain "$IPT4" "$ACCEL_SELECTED_CHAIN"; remove_accel_chain "$IPT4" "$ACCEL_NEW_CHAIN"
 	remove_chain "$IPT4" mangle "$MANGLE_CHAIN"; remove_chain "$IPT4" filter "$FILTER_CHAIN"
 	if [ -n "$IPT6" ]; then
 		remove_accel_parent_jump "$IPT6" "$MANGLE_CHAIN" "$ACCEL_SELECT_CHAIN"; remove_accel_parent_jump "$IPT6" "$MANGLE_CHAIN" "$ACCEL_NEW_CHAIN"
 		remove_accel_parent_jump "$IPT6" "$MANGLE_CHAIN" "$ACCEL_SELECTED_CHAIN"
+		remove_accel_child_jump "$IPT6" "$ACCEL_SELECT_CHAIN" "$ACCEL_SELECTED_CHAIN"
 		remove_accel_chain "$IPT6" "$ACCEL_DOWN_CHAIN"; remove_accel_chain "$IPT6" "$ACCEL_UP_CHAIN"; remove_accel_chain "$IPT6" "$ACCEL_LOCAL_CHAIN"; remove_accel_chain "$IPT6" "$ACCEL_MOVED_CHAIN"; remove_accel_chain "$IPT6" "$ACCEL_SELECT_CHAIN"; remove_accel_chain "$IPT6" "$ACCEL_SELECTED_CHAIN"; remove_accel_chain "$IPT6" "$ACCEL_NEW_CHAIN"
 		remove_chain "$IPT6" mangle "$MANGLE_CHAIN"; remove_chain "$IPT6" filter "$FILTER_CHAIN"
 	fi

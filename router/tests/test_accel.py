@@ -76,6 +76,7 @@ for token in (
     "-m connmark --mark \"$ACCEL_FLOW_FLAG/$ACCEL_FLOW_FLAG\"",
     "-j \"$ACCEL_SELECTED_CHAIN\"", "CAMPUS_ROUTE_ACCEL_DOWN",
     "CAMPUS_ROUTE_ACCEL_UP", "CAMPUS_ROUTE_ACCEL_LOCAL",
+    "remove_accel_child_jump", "ACCEL_SELECT_CHAIN\" \"$ACCEL_SELECTED_CHAIN",
 ):
     assert token in MAIN, token
 
