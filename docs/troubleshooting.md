@@ -27,3 +27,18 @@ rm -f /tmp/luci-indexcache /tmp/luci-modulecache
 ```
 
 控制器只使用固定入口，不支持任意 shell RPC。
+
+## 加速显示“降级”或始终为“监测中”
+
+执行：
+
+```sh
+/usr/bin/campus-route status
+/usr/bin/campus-route-accel status
+iptables-legacy -t mangle -S CAMPUS_ROUTE_ACCEL_SELECT
+iptables-legacy -t mangle -S CAMPUS_ROUTE_ACCEL_MOVED
+```
+
+`accel_reason=backend_unavailable` 表示固件缺少 `xt_statistic`、`xt_conntrack` 或 conntrack 表；此时基础国内/海外分流不受影响。`link_unavailable` 表示校园网或 USB 没有默认路由，先恢复对应接口。`threshold_not_met` 表示带宽、活动连接数或新连接频率尚未同时达到阈值。
+
+加速只作用于新建国内连接。下载已经开始后 USB 分流比例变化不会重置连接；观察 `moved_flows` 和 `moved_bytes` 可确认后续连接是否被选中。若启用了 OpenClash/Passwall 兼容，已有非零 mark 会在加速选择之前返回，不会被接管。

@@ -8,6 +8,7 @@ CampusRoute 是面向 QWRT/OpenWrt 与 Windows 10/11 x64 的双出口策略路�
 
 - QWRT/OpenWrt：IPv4/IPv6、ipset、iptables-legacy、`ip rule` 多表策略路由。
 - 校园网健康探测与自动故障切换；适合每天固定时段的校园网断线，检测到校园网不可用时自动切到 USB。
+- 可选的按连接聚合加速：校园网接近封顶且存在多条国内并发连接时，从新连接中按 10% 起步分配一部分到 USB，最高默认 50%；不做逐包捆绑。
 - USB 缺失默认 `REJECT`；可选的“回退校园网”开关默认关闭。
 - OpenClash/Passwall 兼容开关默认关闭；开启后保留已有 mark/connmark。
 - LuCI 页面 `服务 → Campus Route`，只暴露 status/apply/refresh/start/stop 固定 RPC。
@@ -26,6 +27,7 @@ CampusRoute 是面向 QWRT/OpenWrt 与 Windows 10/11 x64 的双出口策略路�
 | OpenClash/Passwall 兼容 | 关闭 |
 | IPv6 | 开启（若上行没有 IPv6 默认路由，可关闭） |
 | 校园网故障切换 | 开启 |
+| 多线程聚合加速 | 关闭 (`accel_enabled=0`) |
 
 ## 快速上手：QWRT/OpenWrt
 
@@ -55,6 +57,10 @@ CampusRoute 是面向 QWRT/OpenWrt 与 Windows 10/11 x64 的双出口策略路�
    ```
 
 6. 使用 `campus-route status` 观察 `campus_health_state`、`usb_online4/6`、`last_error` 和命中计数。校园网健康探测失败时，国内流量会随下一次 reconcile 自动切换到 USB；恢复后连续成功探测再恢复国内走校园网。
+
+### 启用聚合加速（可选）
+
+在 LuCI 的“多线程聚合加速”区域设置校园网单方向封顶速度（例如 `500` Mbps），确认校园网和 USB 都在线后再打开开关。默认阈值为 85% 触发、75% 释放、至少 8 条活动连接和 2 条/秒新连接，10 秒后从 10% 开始，最高 50%。加速仅影响后续新建国内连接；校园网断线或 USB 拔出时会自动停用，并沿用原有故障切换/阻断策略。
 
 ### 回滚
 
@@ -94,6 +100,7 @@ python router/tests/test_static.py
 python router/tests/test_fixture.py
 python router/tests/test_failover.py
 python router/tests/test_incremental.py
+python router/tests/test_accel.py
 python -m unittest discover -s windows/tests -v
 python -m py_compile windows/campusroute.py
 powershell -ExecutionPolicy Bypass -File windows/build.ps1

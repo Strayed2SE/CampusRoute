@@ -25,6 +25,14 @@ contain portal credentials or the live router's existing Dr.COM/DNS files.
   zero (the default), Campus Route classifies the packet and only changes the
   high-nibble policy bits (mark_mask=0xf000). Existing connmark values are
   restored before classification and saved on a decision.
+* The optional connection-level accelerator is controlled by `accel_enabled=0`
+  (default). When enabled, it measures campus throughput and domestic flow
+  pressure. After the configured hysteresis window it assigns only *new*
+  domestic TCP/UDP connections to USB with a 10% starting share, stepping up
+  to the configured cap (50% by default). Existing connections retain their
+  connmark and are never moved packet-by-packet. Campus/USB health failure,
+  unsupported scope, or a missing `xt_statistic`/conntrack backend immediately
+  drops the share to zero while leaving the base policy intact.
 * Each policy table also contains the connected LAN prefixes (including
   `br-lan`). This is required because fwmark rules run before the main table;
   without the LAN route, marked replies to clients could be sent out a WAN
@@ -63,6 +71,7 @@ fallback.
 ## Commands and WebUI
 
     /usr/bin/campus-route status
+    /usr/bin/campus-route-accel status
     /usr/bin/campus-route reconcile
     /usr/bin/campus-route refresh
     /usr/bin/campus-route snapshot [DIRECTORY]
@@ -73,8 +82,37 @@ The staged snapshot.sh and rollback.sh wrappers call those installed commands.
 LuCI page: Services -> Campus Route. It exposes fixed status, apply, refresh,
 start, and stop actions plus UCI fields for interfaces, IPv6, unknown policy,
 encrypted TCP/UDP ports, USB fallback, campus health probes/failover,
-plugin compatibility, rule sources, and routing table overrides. No arbitrary
-shell RPC is exposed.
+plugin compatibility, connection-level acceleration thresholds, rule sources,
+and routing table overrides. The status JSON includes campus Mbps, active
+domestic-flow estimates, current USB share, moved-flow/byte counters, and the
+last acceleration reason. No arbitrary shell RPC is exposed.
+
+### Aggregation acceleration
+
+The following defaults implement a conservative 500 Mbps campus cap:
+
+```text
+accel_enabled=0
+bandwidth_cap_mbps=500
+accel_trigger_percent=85
+accel_release_percent=75
+accel_min_active_flows=8
+accel_min_new_flows_per_sec=2
+accel_trigger_seconds=10
+accel_release_seconds=30
+accel_max_usb_share_percent=50
+accel_step_percent=10
+accel_sample_interval=5
+```
+
+The daemon samples counters every five seconds. A qualifying high-load window
+must persist for ten seconds before 10% of subsequent domestic connections
+are selected for USB. Further ten-second windows add 10 percentage points up
+to the cap. Low load below 75% for 30 seconds removes one step at a time. The
+selection uses `xt_statistic` on `ctstate NEW` packets with zero policy
+mark/connmark; a private connmark bit identifies selected flows for byte
+accounting. This is connection distribution, not packet bonding, so a TCP or
+QUIC flow remains on its original outlet for its lifetime.
 
 Hotplug file etc/hotplug.d/iface/95-campus-route reconciles after ifup and
 ifdown. etc/cron.d/campus-route refreshes lists weekly at 04:17; the installer

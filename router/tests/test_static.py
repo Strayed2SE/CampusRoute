@@ -12,6 +12,7 @@ def read(rel):
 
 cfg = read("etc/config/campus_route")
 main = read("usr/bin/campus-route")
+accel = read("usr/bin/campus-route-accel")
 update = read("usr/bin/campus-route-update")
 controller = read("usr/lib/lua/luci/controller/campus_route.lua")
 cbi = read("usr/lib/lua/luci/model/cbi/campus_route/main.lua")
@@ -32,6 +33,10 @@ for line in ("option enabled '0'", "option usb_missing_fallback '0'",
              "option campus_probe_timeout '2'", "option campus_fail_threshold '1'",
              "option campus_recover_threshold '2'"):
     assert line in cfg, line
+for line in ("option accel_enabled '0'", "option bandwidth_cap_mbps '500'",
+             "option accel_trigger_percent '85'", "option accel_release_percent '75'",
+             "option accel_max_usb_share_percent '50'", "option accel_step_percent '10'"):
+    assert line in cfg, line
 for line in ("list encrypted_tcp '443'", "list encrypted_udp '443'",
              "option campus_iface 'wan'", "option usb_iface_primary 'wanusb'",
              "option usb_iface_fallback 'wwan'", "option geosite_file",
@@ -51,6 +56,11 @@ for token in ("CAMPUS_ROUTE_MANGLE", "CAMPUS_ROUTE_FILTER", "campus_cn4",
     assert token in main, token
 assert "scope" in main.lower()
 assert "DOMESTIC_PRECEDENCE" in main
+for token in ("CAMPUS_ROUTE_ACCEL_SELECT", "CAMPUS_ROUTE_ACCEL_DOWN",
+              "CAMPUS_ROUTE_ACCEL_UP", "CAMPUS_ROUTE_ACCEL_LOCAL",
+              "CAMPUS_ROUTE_ACCEL_NEW", "CAMPUS_ROUTE_ACCEL_MOVED",
+              "xt_statistic", "/usr/bin/campus-route reconcile"):
+    assert token in (main + accel), token
 assert "fwmark \"$MARK_CAMPUS/$MASK\"" in main
 assert "fwmark \"$MARK_USB/$MASK\"" in main
 assert "fwmark \"$MARK_BLOCK/$MASK\"" in main

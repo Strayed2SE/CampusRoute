@@ -79,6 +79,75 @@ o = s:option(Flag, "ipv6", translate("启用 IPv6 分流"))
 o.default = "1"
 o.rmempty = false
 
+o = s:option(Flag, "accel_enabled", translate("多线程聚合加速"))
+o.default = "0"
+o.rmempty = false
+o.description = translate("默认关闭；仅在校园网和 USB 都在线、国内连接持续高负载时，将新建国内连接的一部分分配到 USB。")
+
+o = s:option(DummyValue, "_accel_advanced", translate("高级加速设置"))
+o.rawhtml = true
+o.default = translate("展开“多线程聚合加速”后调整阈值；关闭加速时这些参数不会安装任何规则。")
+
+o = s:option(Value, "bandwidth_cap_mbps", translate("宽带封顶速度（Mbps）"))
+o.datatype = "and(uinteger,min(1),max(100000))"
+o.default = "500"
+o.rmempty = false
+o.description = translate("填写校园网单方向封顶速度，例如 500。")
+
+o = s:option(Value, "accel_trigger_percent", translate("加速触发利用率（%）"))
+o.datatype = "and(uinteger,min(50),max(99))"
+o.default = "85"
+o.rmempty = false
+o:depends("accel_enabled", "1")
+
+o = s:option(Value, "accel_release_percent", translate("加速释放利用率（%）"))
+o.datatype = "and(uinteger,min(1),max(98))"
+o.default = "75"
+o.rmempty = false
+o:depends("accel_enabled", "1")
+
+o = s:option(Value, "accel_min_active_flows", translate("最少活动连接数"))
+o.datatype = "and(uinteger,min(2),max(100000))"
+o.default = "8"
+o.rmempty = false
+o:depends("accel_enabled", "1")
+
+o = s:option(Value, "accel_min_new_flows_per_sec", translate("最少新连接频率（条/秒）"))
+o.datatype = "and(uinteger,min(1),max(10000))"
+o.default = "2"
+o.rmempty = false
+o:depends("accel_enabled", "1")
+
+o = s:option(Value, "accel_trigger_seconds", translate("触发持续时间（秒）"))
+o.datatype = "and(uinteger,min(5),max(3600))"
+o.default = "10"
+o.rmempty = false
+o:depends("accel_enabled", "1")
+
+o = s:option(Value, "accel_release_seconds", translate("释放持续时间（秒）"))
+o.datatype = "and(uinteger,min(10),max(3600))"
+o.default = "30"
+o.rmempty = false
+o:depends("accel_enabled", "1")
+
+o = s:option(Value, "accel_max_usb_share_percent", translate("最大 USB 分流比例（%）"))
+o.datatype = "and(uinteger,min(10),max(80))"
+o.default = "50"
+o.rmempty = false
+o:depends("accel_enabled", "1")
+
+o = s:option(Value, "accel_step_percent", translate("每次增加分流比例（%）"))
+o.datatype = "and(uinteger,min(1),max(80))"
+o.default = "10"
+o.rmempty = false
+o:depends("accel_enabled", "1")
+
+o = s:option(Value, "accel_sample_interval", translate("加速采样间隔（秒）"))
+o.datatype = "and(uinteger,min(2),max(30))"
+o.default = "5"
+o.rmempty = false
+o:depends("accel_enabled", "1")
+
 o = s:option(ListValue, "unknown_policy", translate("未知目的地"))
 o:value("usb", translate("USB"))
 o:value("campus", translate("校园网"))
