@@ -56,10 +56,10 @@ active_flows() {
 	local f n
 	for f in /proc/net/nf_conntrack /proc/net/ip_conntrack; do
 		[ -r "$f" ] || continue
-		n="$(awk -v mark="$MARK_CAMPUS" -v accel="$MARK_ACCEL" '/ESTABLISHED|ASSURED/ && (index($0,"mark=" mark) || index($0,"mark=" mark ",") || index($0,"mark=" accel) || index($0,"mark=" accel ",")) {n++} END {print n+0}' "$f" 2>/dev/null)"
+		n="$(awk -v mark="$MARK_CAMPUS" -v accel="$MARK_ACCEL" '/ESTABLISHED|ASSURED/ && (index($0,"mark=" mark) || index($0,"mark=" mark ",") || index($0,"mark=0x1000") || index($0,"mark=" accel) || index($0,"mark=" accel ",") || index($0,"mark=0x40002000")) {n++} END {print n+0}' "$f" 2>/dev/null)"
 		printf '%s\n' "$n"; return
 	done
-	if command -v conntrack >/dev/null 2>&1; then conntrack -L 2>/dev/null | awk -v mark="$MARK_CAMPUS" -v accel="$MARK_ACCEL" '/ESTABLISHED|ASSURED/ && (index($0,"mark=" mark) || index($0,"mark=" mark ",") || index($0,"mark=" accel) || index($0,"mark=" accel ",")) {n++} END {print n+0}'; return; fi
+	if command -v conntrack >/dev/null 2>&1; then conntrack -L 2>/dev/null | awk -v mark="$MARK_CAMPUS" -v accel="$MARK_ACCEL" '/ESTABLISHED|ASSURED/ && (index($0,"mark=" mark) || index($0,"mark=" mark ",") || index($0,"mark=0x1000") || index($0,"mark=" accel) || index($0,"mark=" accel ",") || index($0,"mark=0x40002000")) {n++} END {print n+0}'; return; fi
 	printf '%s\n' 0
 }
 write_state() {

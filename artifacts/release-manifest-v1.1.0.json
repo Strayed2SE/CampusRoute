@@ -1,20 +1,20 @@
 {
   "product": "CampusRoute",
   "version": "v1.1.0-public",
-  "generated_utc": "2026-08-31T16:38:21.397080+00:00",
+  "generated_utc": "2026-08-31T16:41:21.894014+00:00",
   "owner": "Strayed2SE",
   "feature": "connection-level domestic spillover acceleration",
   "windows_unchanged": true,
   "artifacts": [
     {
       "name": "CampusRoute-public-source-v1.1.0.zip",
-      "sha256": "4e1bb45d56da33f7c29c6e08eee86c81b17c4d01ee6fd45a2a99915cc0cdee54",
-      "bytes": 159017
+      "sha256": "c7aa3c641bee50227247b6f9e1e78e26879676abc2e7f82af61c65854d46c2b2",
+      "bytes": 159034
     },
     {
       "name": "CampusRoute-router-public-v1.1.0.tar.gz",
-      "sha256": "f088b064ee6530bd4bb43aa1dcd8152685bfe1b16b7c49a3c2b4ff366b4dcce9",
-      "bytes": 45776
+      "sha256": "ef9a604f4f5c4839eeca9d3c7b6d1e4aec55f24a9a00c70dcdf5bab9818ae7e3",
+      "bytes": 45814
     },
     {
       "name": "CampusRoute-Windows-x64-public-v1.1.0.zip",
