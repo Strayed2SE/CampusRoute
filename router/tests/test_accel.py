@@ -100,6 +100,18 @@ assert 'accel_iface_bytes()' in ACCEL
 assert '/usr/bin/campus-route reconcile' in ACCEL
 assert 'case "$v" in *legacy*) IPT4=' in ACCEL
 
+# Hotspot learning is destination-only, TTL-bound and precedes ordinary
+# domestic classification; it never touches established or marked flows.
+for token in (
+    "campus_accel_hot4", "campus_accel_hot6", "accel_learning_enabled",
+    "accel_hot_ttl", "accel_hot_max_entries", "accel_hot_trigger_percent",
+    "accel_hot_min_new_flows", "ipset add \"$HOT4\"", "ipset add \"$HOT6\"",
+    "-m set --match-set \"$hotset\" dst", "timeout \"$ACCEL_HOT_TTL\"",
+):
+    assert token in MAIN or token in ACCEL, token
+assert MAIN.index('match-set "$hotset" dst') < MAIN.index('match-set "$set" dst')
+assert "ESTABLISHED" in ACCEL and "ipset test campus_cn4" in ACCEL
+
 print("test_accel: PASS")
 
 

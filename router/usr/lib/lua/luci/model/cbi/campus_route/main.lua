@@ -148,6 +148,36 @@ o.default = "5"
 o.rmempty = false
 o:depends("accel_enabled", "1")
 
+o = s:option(Flag, "accel_learning_enabled", translate("热点学习缓存"))
+o.default = "1"
+o.rmempty = false
+o.description = translate("短时高负载未及时触发时，缓存国内目的 IP；缓存仅影响后续新连接并自动过期。")
+o:depends("accel_enabled", "1")
+
+o = s:option(Value, "accel_hot_ttl", translate("热点缓存有效期（秒）"))
+o.datatype = "and(uinteger,min(60),max(86400))"
+o.default = "900"
+o.rmempty = false
+o:depends("accel_learning_enabled", "1")
+
+o = s:option(Value, "accel_hot_max_entries", translate("热点缓存最大条目"))
+o.datatype = "and(uinteger,min(16),max(4096))"
+o.default = "256"
+o.rmempty = false
+o:depends("accel_learning_enabled", "1")
+
+o = s:option(Value, "accel_hot_trigger_percent", translate("热点学习触发利用率（%）"))
+o.datatype = "and(uinteger,min(40),max(99))"
+o.default = "60"
+o.rmempty = false
+o:depends("accel_learning_enabled", "1")
+
+o = s:option(Value, "accel_hot_min_new_flows", translate("热点学习最少新连接数/秒"))
+o.datatype = "and(uinteger,min(1),max(10000))"
+o.default = "2"
+o.rmempty = false
+o:depends("accel_learning_enabled", "1")
+
 o = s:option(ListValue, "unknown_policy", translate("未知目的地"))
 o:value("usb", translate("USB"))
 o:value("campus", translate("校园网"))

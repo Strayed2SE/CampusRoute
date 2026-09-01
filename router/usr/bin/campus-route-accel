@@ -16,6 +16,8 @@ UP_CHAIN=CAMPUS_ROUTE_ACCEL_UP
 LOCAL_CHAIN=CAMPUS_ROUTE_ACCEL_LOCAL
 NEW_CHAIN=CAMPUS_ROUTE_ACCEL_NEW
 MOVED_CHAIN=CAMPUS_ROUTE_ACCEL_MOVED
+HOT4=campus_accel_hot4
+HOT6=campus_accel_hot6
 MARK_CAMPUS=4096
 MARK_ACCEL=1073750016
 
@@ -53,6 +55,47 @@ counter_bytes() { local cmd="$1" chain="$2"; [ -n "$cmd" ] || { printf '0\n'; re
 counter_packets() { local cmd="$1" chain="$2"; [ -n "$cmd" ] || { printf '0\n'; return; }; "$cmd" -t mangle -L "$chain" -v -x -n 2>/dev/null | awk 'NR>2 && $1 ~ /^[0-9]+$/ {p+=$1} END {print p+0}'; }
 last_rule_bytes() { local cmd="$1" chain="$2"; [ -n "$cmd" ] || { printf '0\n'; return; }; "$cmd" -t mangle -L "$chain" -v -x -n 2>/dev/null | awk 'NR>2 && $1 ~ /^[0-9]+$/ {b=$2; found=1} END {print found ? b+0 : 0}'; }
 first_rule_packets() { local cmd="$1" chain="$2"; [ -n "$cmd" ] || { printf '0\n'; return; }; "$cmd" -t mangle -L "$chain" -v -x -n 2>/dev/null | awk 'NR==3 {print $1+0; found=1} END {if(!found) print 0}'; }
+hot_count() { local set="$1"; ipset list "$set" 2>/dev/null | awk -F: '/Number of entries:/ {print $2+0; found=1} END {if(!found) print 0}'; }
+conntrack_candidates() {
+	local f="$1" mark=0x1000
+	awk -v mark="$mark" '/ESTABLISHED|ASSURED/ && (index($0,"mark=" mark) || index($0,"mark=" mark ",") || index($0,"mark=4096")) {
+		d=""; for (i=1;i<=NF;i++) { if (d == "" && $i ~ /^dst=/) { d=$i; sub(/^dst=/,"",d) } }
+		if (d != "") print d
+	}' "$f" 2>/dev/null
+}
+is_private4() { case "$1" in 0.*|10.*|100.64.*|127.*|169.254.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*|192.0.0.*|192.168.*|198.18.*|22[4-9].*|23[0-9].*|24[0-9].*|25[0-5].*) return 0 ;; esac; return 1; }
+is_private6() { case "$1" in ::*|fc*|fd*|fe8*|fe9*|fea*|feb*|ff*) return 0 ;; esac; return 1; }
+learn_hotspots() {
+	local reason="$1" f candidates ip count4=0 count6=0 now ttl
+	[ "$(cfg_bool accel_learning_enabled)" -eq 1 ] || return 0
+	ttl="$(cfg accel_hot_ttl)"; case "$ttl" in ''|*[!0-9]*) ttl=900 ;; esac
+	[ "$NEW_RATE" -ge "$ACCEL_HOT_MIN_NEW_FLOWS" ] 2>/dev/null || return 0
+	[ "$DOWN_MBPS" -ge $((CAP * ACCEL_HOT_TRIGGER_PERCENT / 100)) ] 2>/dev/null || [ "$UP_MBPS" -ge $((CAP * ACCEL_HOT_TRIGGER_PERCENT / 100)) ] 2>/dev/null || return 0
+	for f in /proc/net/nf_conntrack /proc/net/ip_conntrack; do [ -r "$f" ] && break; done
+	[ -r "$f" ] || { command -v conntrack >/dev/null 2>&1 || return 0; f="$STATE_DIR/conntrack.$$"; conntrack -L 2>/dev/null > "$f"; }
+	candidates="$STATE_DIR/hot-candidates.$$"; : > "$candidates"
+	conntrack_candidates "$f" | sort -u > "$candidates"
+	while IFS= read -r ip; do
+		[ -n "$ip" ] || continue
+		case "$ip" in *:*)
+			is_private6 "$ip" && continue
+			ipset test campus_cn6 "$ip" >/dev/null 2>&1 || continue
+			ipset add "$HOT6" "$ip" timeout "$ttl" -exist >/dev/null 2>&1 && count6=$((count6 + 1))
+			;;
+		*)
+			is_private4 "$ip" && continue
+			ipset test campus_cn4 "$ip" >/dev/null 2>&1 || continue
+			ipset add "$HOT4" "$ip" timeout "$ttl" -exist >/dev/null 2>&1 && count4=$((count4 + 1))
+			;;
+		esac
+	done < "$candidates"
+	rm -f "$candidates"; [ -f "$STATE_DIR/conntrack.$$" ] && rm -f "$STATE_DIR/conntrack.$$"
+	if [ "$count4" -gt 0 ] || [ "$count6" -gt 0 ]; then
+		now="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)"
+		HOT_LAST_LEARN="$now"; HOT_LAST_REASON="$reason"; HOT_LEARNED=$((HOT_LEARNED + count4 + count6))
+		/usr/bin/campus-route reconcile >/dev/null 2>&1 || true
+	fi
+}
 active_flows() {
 	local f n
 	for f in /proc/net/nf_conntrack /proc/net/ip_conntrack; do
@@ -75,6 +118,8 @@ write_stats() {
 		printf 'sample_epoch=%s\ncampus_down_bytes=%s\ncampus_up_bytes=%s\nnew_counter=%s\n' "$NOW" "$DOWN" "$UP" "$NEW"
 		printf 'campus_down_mbps=%s\ncampus_up_mbps=%s\nactive_flows=%s\nnew_flows_per_sec=%s\nmoved_flows=%s\nmoved_bytes=%s\nselected_counter=%s\nmoved_counter=%s\n' \
 			"$DOWN_MBPS" "$UP_MBPS" "$FLOWS" "$NEW_RATE" "$MOVED_FLOWS" "$MOVED_BYTES" "$SELECTED" "$MOVED_COUNTER"
+		printf 'hot_count4=%s\nhot_count6=%s\nhot_learned=%s\nhot_last_learn=%s\nhot_last_reason=%s\n' \
+			"$(hot_count "$HOT4")" "$(hot_count "$HOT6")" "$HOT_LEARNED" "$HOT_LAST_LEARN" "$HOT_LAST_REASON"
 	} > "$tmp" && mv -f "$tmp" "$STATS_FILE"
 }
 reconcile_if_changed() {
@@ -114,6 +159,9 @@ sample() {
 	MIN_NEW="$(cfg accel_min_new_flows_per_sec)"; case "$MIN_NEW" in ''|*[!0-9]*) MIN_NEW=2 ;; esac
 	TRIGGER_SECONDS="$(cfg accel_trigger_seconds)"; case "$TRIGGER_SECONDS" in ''|*[!0-9]*) TRIGGER_SECONDS=10 ;; esac
 	RELEASE_SECONDS="$(cfg accel_release_seconds)"; case "$RELEASE_SECONDS" in ''|*[!0-9]*) RELEASE_SECONDS=30 ;; esac
+	ACCEL_HOT_MIN_NEW_FLOWS="$(cfg accel_hot_min_new_flows)"; case "$ACCEL_HOT_MIN_NEW_FLOWS" in ''|*[!0-9]*) ACCEL_HOT_MIN_NEW_FLOWS=2 ;; esac
+	ACCEL_HOT_TRIGGER_PERCENT="$(cfg accel_hot_trigger_percent)"; case "$ACCEL_HOT_TRIGGER_PERCENT" in ''|*[!0-9]*) ACCEL_HOT_TRIGGER_PERCENT=60 ;; esac
+	CAP_HOT_TRIGGER=$((CAP * ACCEL_HOT_TRIGGER_PERCENT / 100))
 	if [ "$ACCEL_ENABLED" -ne 1 ]; then ACTIVE=0; SHARE=0; STATE=disabled; REASON=disabled; HIGH_SECONDS=0; LOW_SECONDS=0; NOW="$(date +%s)"; DOWN=0; UP=0; NEW=0; DOWN_MBPS=0; UP_MBPS=0; FLOWS=0; NEW_RATE=0; MOVED_FLOWS=0; MOVED_BYTES=0; MOVED_COUNTER=0; SELECTED=0; write_state; write_stats; reconcile_if_changed; return 0; fi
 	if [ -z "$IPT4" ] || ! "$IPT4" -t mangle -S "$NEW_CHAIN" >/dev/null 2>&1 || ! "$IPT4" -t mangle -S "$DOWN_CHAIN" >/dev/null 2>&1 || ! "$IPT4" -m statistic --help >/dev/null 2>&1 || { [ ! -r /proc/net/nf_conntrack ] && [ ! -r /proc/net/ip_conntrack ] && ! command -v conntrack >/dev/null 2>&1; }; then
 		ACTIVE=0; SHARE=0; STATE=degraded; REASON=backend_unavailable; HIGH_SECONDS=0; LOW_SECONDS=0; NOW="$(date +%s)"; DOWN=0; UP=0; NEW=0; DOWN_MBPS=0; UP_MBPS=0; FLOWS=0; NEW_RATE=0; MOVED_FLOWS=0; MOVED_BYTES=0; MOVED_COUNTER=0; SELECTED=0; write_state; write_stats; reconcile_if_changed; return 0
@@ -135,9 +183,14 @@ sample() {
 	# Divide before multiplying to remain safe on 32-bit OpenWrt shells.
 	DOWN_MBPS=$(( (DOWN - PREV_DOWN) / ELAPSED / 125000 )); UP_MBPS=$(( (UP - PREV_UP) / ELAPSED / 125000 )); NEW_RATE=$(( (NEW - PREV_NEW) / ELAPSED )); FLOWS="$(active_flows)"
 	PREV_SELECTED="$(stat_get selected_counter)"; PREV_MOVED_COUNTER="$(stat_get moved_counter)"; MOVED_FLOWS="$(stat_get moved_flows)"; MOVED_BYTES="$(stat_get moved_bytes)"
+	HOT_LEARNED="$(stat_get hot_learned)"; case "$HOT_LEARNED" in ''|*[!0-9]*) HOT_LEARNED=0 ;; esac; HOT_LAST_LEARN="$(stat_get hot_last_learn)"; HOT_LAST_REASON="$(stat_get hot_last_reason)"; [ -n "$HOT_LAST_LEARN" ] || HOT_LAST_LEARN=never; [ -n "$HOT_LAST_REASON" ] || HOT_LAST_REASON=none
 	case "$PREV_SELECTED" in ''|*[!0-9]*) PREV_SELECTED="$SELECTED" ;; esac; case "$PREV_MOVED_COUNTER" in ''|*[!0-9]*) PREV_MOVED_COUNTER="$MOVED_COUNTER" ;; esac; case "$MOVED_FLOWS" in ''|*[!0-9]*) MOVED_FLOWS=0 ;; esac; case "$MOVED_BYTES" in ''|*[!0-9]*) MOVED_BYTES=0 ;; esac
 	[ "$SELECTED" -ge "$PREV_SELECTED" ] 2>/dev/null && MOVED_FLOWS=$((MOVED_FLOWS + SELECTED - PREV_SELECTED)); [ "$MOVED_COUNTER" -ge "$PREV_MOVED_COUNTER" ] 2>/dev/null && MOVED_BYTES=$((MOVED_BYTES + MOVED_COUNTER - PREV_MOVED_COUNTER))
 	[ "$MOVED_COUNTER" -lt "$PREV_MOVED_COUNTER" ] 2>/dev/null && : # firewall rebuild reset; keep the cumulative total
+	# Learn domestic destinations during short saturation bursts even when the
+	# normal 10-second trigger window has not completed. The cache is TTL-bound,
+	# destination-only, and only affects subsequent connections.
+	learn_hotspots pretrigger
 	HIGH=0; LOW=0; [ $((DOWN_MBPS * 100 / CAP)) -ge "$TRIGGER" ] 2>/dev/null && HIGH=1; [ $((UP_MBPS * 100 / CAP)) -ge "$TRIGGER" ] 2>/dev/null && HIGH=1; [ $((DOWN_MBPS * 100 / CAP)) -le "$RELEASE" ] 2>/dev/null && [ $((UP_MBPS * 100 / CAP)) -le "$RELEASE" ] 2>/dev/null && LOW=1; [ "$FLOWS" -ge "$MIN_FLOWS" ] 2>/dev/null || HIGH=0; [ "$NEW_RATE" -ge "$MIN_NEW" ] 2>/dev/null || HIGH=0
 	[ "$HIGH" -eq 1 ] && { HIGH_SECONDS=$((HIGH_SECONDS + ELAPSED)); LOW_SECONDS=0; } || HIGH_SECONDS=0; [ "$LOW" -eq 1 ] && LOW_SECONDS=$((LOW_SECONDS + ELAPSED)) || LOW_SECONDS=0
 	OLD_SHARE="$SHARE"; OLD_ACTIVE="$ACTIVE"

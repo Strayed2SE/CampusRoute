@@ -42,3 +42,20 @@ iptables-legacy -t mangle -S CAMPUS_ROUTE_ACCEL_MOVED
 `accel_reason=backend_unavailable` 表示固件缺少 `xt_statistic`、`xt_conntrack` 或 conntrack 表；此时基础国内/海外分流不受影响。`link_unavailable` 表示校园网或 USB 没有默认路由，先恢复对应接口。`threshold_not_met` 表示带宽、活动连接数或新连接频率尚未同时达到阈值。
 
 加速只作用于新建国内连接。下载已经开始后 USB 分流比例变化不会重置连接；观察 `moved_flows` 和 `moved_bytes` 可确认后续连接是否被选中。若启用了 OpenClash/Passwall 兼容，已有非零 mark 会在加速选择之前返回，不会被接管。
+
+
+## 短时测速未触发加速
+
+如果测速很短、状态一直是“监测中”，可检查热点学习字段：
+
+```sh
+/usr/bin/campus-route-accel status
+ipset list campus_accel_hot4
+ipset list campus_accel_hot6
+```
+
+`hot_count4/6` 表示当前缓存条目，`hot_learned` 是累计学习次数，
+`hot_last_reason=pretrigger` 表示在常规触发窗口完成前捕获了突发负载。缓存
+只保存目的 IP，自动按 `accel_hot_ttl` 过期；清空缓存可执行 `campus-route
+reconcile force`（会重建基础集合与策略）。若没有 conntrack 表或 `ipset`
+不支持 timeout，热点学习保持关闭，基础分流继续运行。

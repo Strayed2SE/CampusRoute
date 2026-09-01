@@ -27,6 +27,8 @@ ACCEL_LOCAL_CHAIN=CAMPUS_ROUTE_ACCEL_LOCAL
 ACCEL_NEW_CHAIN=CAMPUS_ROUTE_ACCEL_NEW
 ACCEL_SELECTED_CHAIN=CAMPUS_ROUTE_ACCEL_SELECTED
 ACCEL_MOVED_CHAIN=CAMPUS_ROUTE_ACCEL_MOVED
+ACCEL_HOT4=campus_accel_hot4
+ACCEL_HOT6=campus_accel_hot6
 # Private connmark bit used only to identify connections selected by the
 # accelerator.  The policy nibble remains MASK (0xf000), so routing lookups
 # and existing plugin marks keep their documented semantics.
@@ -88,6 +90,11 @@ ACCEL_RELEASE_SECONDS=30
 ACCEL_MAX_USB_SHARE_PERCENT=50
 ACCEL_STEP_PERCENT=10
 ACCEL_SAMPLE_INTERVAL=5
+ACCEL_LEARNING_ENABLED=1
+ACCEL_HOT_TTL=900
+ACCEL_HOT_MAX_ENTRIES=256
+ACCEL_HOT_TRIGGER_PERCENT=60
+ACCEL_HOT_MIN_NEW_FLOWS=2
 ACCEL_BACKEND_OK=0
 ACCEL_ACTIVE=0
 ACCEL_SHARE_PERCENT=0
@@ -99,6 +106,11 @@ ACCEL_ACTIVE_FLOWS=0
 ACCEL_NEW_FLOWS_PER_SEC=0
 ACCEL_MOVED_FLOWS=0
 ACCEL_MOVED_BYTES=0
+ACCEL_HOT_COUNT4=0
+ACCEL_HOT_COUNT6=0
+ACCEL_HOT_LEARNED=0
+ACCEL_HOT_LAST_LEARN=never
+ACCEL_HOT_LAST_REASON=none
 
 mkdir -p "$STATE_DIR" /etc/campus-route "$RULE_DIR" 2>/dev/null
 
@@ -199,6 +211,15 @@ load_config() {
 	[ "$ACCEL_STEP_PERCENT" -ge 1 ] 2>/dev/null || ACCEL_STEP_PERCENT=1; [ "$ACCEL_STEP_PERCENT" -le "$ACCEL_MAX_USB_SHARE_PERCENT" ] 2>/dev/null || ACCEL_STEP_PERCENT="$ACCEL_MAX_USB_SHARE_PERCENT"
 	ACCEL_SAMPLE_INTERVAL="$(cfg accel_sample_interval)"; case "$ACCEL_SAMPLE_INTERVAL" in ''|*[!0-9]*) ACCEL_SAMPLE_INTERVAL=5 ;; esac
 	[ "$ACCEL_SAMPLE_INTERVAL" -ge 2 ] 2>/dev/null || ACCEL_SAMPLE_INTERVAL=2; [ "$ACCEL_SAMPLE_INTERVAL" -le 30 ] 2>/dev/null || ACCEL_SAMPLE_INTERVAL=30
+	ACCEL_LEARNING_ENABLED="$(cfg_bool accel_learning_enabled)"
+	ACCEL_HOT_TTL="$(cfg accel_hot_ttl)"; case "$ACCEL_HOT_TTL" in ''|*[!0-9]*) ACCEL_HOT_TTL=900 ;; esac
+	[ "$ACCEL_HOT_TTL" -ge 60 ] 2>/dev/null || ACCEL_HOT_TTL=60; [ "$ACCEL_HOT_TTL" -le 86400 ] 2>/dev/null || ACCEL_HOT_TTL=86400
+	ACCEL_HOT_MAX_ENTRIES="$(cfg accel_hot_max_entries)"; case "$ACCEL_HOT_MAX_ENTRIES" in ''|*[!0-9]*) ACCEL_HOT_MAX_ENTRIES=256 ;; esac
+	[ "$ACCEL_HOT_MAX_ENTRIES" -ge 16 ] 2>/dev/null || ACCEL_HOT_MAX_ENTRIES=16; [ "$ACCEL_HOT_MAX_ENTRIES" -le 4096 ] 2>/dev/null || ACCEL_HOT_MAX_ENTRIES=4096
+	ACCEL_HOT_TRIGGER_PERCENT="$(cfg accel_hot_trigger_percent)"; case "$ACCEL_HOT_TRIGGER_PERCENT" in ''|*[!0-9]*) ACCEL_HOT_TRIGGER_PERCENT=60 ;; esac
+	[ "$ACCEL_HOT_TRIGGER_PERCENT" -ge 40 ] 2>/dev/null || ACCEL_HOT_TRIGGER_PERCENT=40; [ "$ACCEL_HOT_TRIGGER_PERCENT" -le 99 ] 2>/dev/null || ACCEL_HOT_TRIGGER_PERCENT=99
+	ACCEL_HOT_MIN_NEW_FLOWS="$(cfg accel_hot_min_new_flows)"; case "$ACCEL_HOT_MIN_NEW_FLOWS" in ''|*[!0-9]*) ACCEL_HOT_MIN_NEW_FLOWS=2 ;; esac
+	[ "$ACCEL_HOT_MIN_NEW_FLOWS" -ge 1 ] 2>/dev/null || ACCEL_HOT_MIN_NEW_FLOWS=1
 }
 
 check_backends() {
@@ -637,6 +658,17 @@ ensure_geo_ipset() {
 	return 0
 }
 
+ensure_hot_ipset() {
+	local set="$1" family="$2"
+	[ "$ACCEL_LEARNING_ENABLED" -eq 1 ] || { ipset destroy "$set" >/dev/null 2>&1 || true; return 0; }
+	case "$family" in
+		4) ipset create "$set" hash:net family inet timeout "$ACCEL_HOT_TTL" hashsize 256 maxelem "$ACCEL_HOT_MAX_ENTRIES" -exist || return 1 ;;
+		6) ipset create "$set" hash:net family inet6 timeout "$ACCEL_HOT_TTL" hashsize 256 maxelem "$ACCEL_HOT_MAX_ENTRIES" -exist || return 1 ;;
+		*) return 1 ;;
+	esac
+	return 0
+}
+
 remove_jump() { local cmd="$1" table="$2" chain="$3" target="$4" n=0; while [ "$n" -lt 16 ]; do "$cmd" -t "$table" -D "$chain" -j "$target" >/dev/null 2>&1 || break; n=$((n + 1)); done; }
 remove_chain() { local cmd="$1" table="$2" chain="$3"; remove_jump "$cmd" "$table" PREROUTING "$chain"; remove_jump "$cmd" "$table" OUTPUT "$chain"; remove_jump "$cmd" "$table" FORWARD "$chain"; "$cmd" -t "$table" -F "$chain" >/dev/null 2>&1; "$cmd" -t "$table" -X "$chain" >/dev/null 2>&1; }
 remove_accel_parent_jump() { local cmd="$1" parent="$2" target="$3" n=0; [ -n "$cmd" ] || return 0; while [ "$n" -lt 16 ]; do "$cmd" -t mangle -D "$parent" -j "$target" >/dev/null 2>&1 || break; n=$((n + 1)); done; }
@@ -658,7 +690,7 @@ accel_new_counter() { local cmd="$1"; [ -n "$cmd" ] || { printf '0\n'; return; }
 accel_probability() { case "$1" in 100) printf '1.0' ;; *) printf '0.%02d' "$1" ;; esac; }
 
 add_policy_rules() {
-	local cmd="$1" family="$2" set="$3" geoset="$4" usb_target="$5" unknown_target="$6" tcp_ports="$7" udp_ports="$8" campus_target="$9" probe_src="${10}" restore_mask="$MASK" host accel_share=0
+	local cmd="$1" family="$2" set="$3" geoset="$4" hotset="$5" usb_target="$6" unknown_target="$7" tcp_ports="$8" udp_ports="$9" campus_target="${10}" probe_src="${11}" restore_mask="$MASK" host accel_share=0
 	[ -n "$campus_target" ] || campus_target="$MARK_CAMPUS"
 	[ "$PLUGIN_COMPAT" -eq 1 ] && restore_mask=0xffffffff
 	"$cmd" -t mangle -N "$MANGLE_CHAIN" >/dev/null 2>&1; "$cmd" -t mangle -F "$MANGLE_CHAIN" >/dev/null 2>&1
@@ -723,6 +755,14 @@ add_policy_rules() {
 	if [ "$family" = 4 ]; then for cidr in 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.168.0.0/16 198.18.0.0/15 224.0.0.0/4 240.0.0.0/4; do "$cmd" -t mangle -A "$MANGLE_CHAIN" -d "$cidr" -j RETURN >/dev/null 2>&1; done; else for cidr in ::/128 ::1/128 fc00::/7 fe80::/10 ff00::/8 2001:db8::/32; do "$cmd" -t mangle -A "$MANGLE_CHAIN" -d "$cidr" -j RETURN >/dev/null 2>&1; done; fi
 	"$cmd" -t mangle -A "$MANGLE_CHAIN" -p udp -m multiport --dports 53,123 -j MARK --set-xmark "$campus_target/$MASK" >/dev/null 2>&1; save_mark_return "$cmd" "$campus_target"
 	"$cmd" -t mangle -A "$MANGLE_CHAIN" -p tcp --dport 53 -j MARK --set-xmark "$campus_target/$MASK" >/dev/null 2>&1; save_mark_return "$cmd" "$campus_target"
+	# Learned hotspots are destination prefixes that previously appeared during
+	# a short campus saturation window. Match only NEW, unmarked connections so
+	# established flows remain on their original path and plugins retain control.
+	if [ "$ACCEL_LEARNING_ENABLED" -eq 1 ] && [ -n "$hotset" ] && [ "$usb_target" != "$MARK_BLOCK" ] && { [ "$family" = 4 ] && [ "$USB_ONLINE4" -eq 1 ] || [ "$family" = 6 ] && [ "$USB_ONLINE6" -eq 1 ]; }; then
+		"$cmd" -t mangle -A "$MANGLE_CHAIN" -m conntrack --ctstate NEW -m mark --mark 0x0/"$MASK" -m connmark --mark 0x0/"$MASK" -m set --match-set "$hotset" dst -j MARK --set-xmark "$usb_target/$MASK" >/dev/null 2>&1
+		[ "$usb_target" = "$MARK_USB" ] && "$cmd" -t mangle -A "$MANGLE_CHAIN" -m mark --mark "$MARK_USB/$MASK" -j CONNMARK --set-xmark "$ACCEL_FLOW_FLAG/$ACCEL_FLOW_FLAG" >/dev/null 2>&1
+		save_mark_return "$cmd" "$usb_target"
+	fi
 	# Count domestic candidate NEW flows after all portal/DNS/NTP/control exits.
 	# The child chain only returns, so it never changes the packet decision.
 	remove_accel_parent_jump "$cmd" "$MANGLE_CHAIN" "$ACCEL_NEW_CHAIN"
@@ -800,7 +840,7 @@ setup_firewall() {
 	remove_chain "$IPT4" mangle "$MANGLE_CHAIN"; remove_chain "$IPT4" filter "$FILTER_CHAIN"
 	# Remove an old IPv6 policy even when IPv6 has just been disabled.
 	[ -n "$IPT6" ] && { remove_chain "$IPT6" mangle "$MANGLE_CHAIN"; remove_chain "$IPT6" filter "$FILTER_CHAIN"; }
-	add_policy_rules "$IPT4" 4 "$SET4" "$GEO4" "$usb_target4" "$unknown_target4" "$ENCRYPTED_TCP" "$ENCRYPTED_UDP" "$campus_target4" "$CAMPUS_SRC4"; [ "$IPV6" -eq 1 ] && add_policy_rules "$IPT6" 6 "$SET6" "$GEO6" "$usb_target6" "$unknown_target6" "$ENCRYPTED_TCP" "$ENCRYPTED_UDP" "$campus_target6" "$CAMPUS_SRC6"
+	add_policy_rules "$IPT4" 4 "$SET4" "$GEO4" "$ACCEL_HOT4" "$usb_target4" "$unknown_target4" "$ENCRYPTED_TCP" "$ENCRYPTED_UDP" "$campus_target4" "$CAMPUS_SRC4"; [ "$IPV6" -eq 1 ] && add_policy_rules "$IPT6" 6 "$SET6" "$GEO6" "$ACCEL_HOT6" "$usb_target6" "$unknown_target6" "$ENCRYPTED_TCP" "$ENCRYPTED_UDP" "$campus_target6" "$CAMPUS_SRC6"
 	"$IPT4" -t filter -N "$FILTER_CHAIN" >/dev/null 2>&1; "$IPT4" -t filter -F "$FILTER_CHAIN" >/dev/null 2>&1; "$IPT4" -t filter -A "$FILTER_CHAIN" -m mark --mark "$MARK_BLOCK/$MASK" -j REJECT >/dev/null 2>&1
 	# Health probes originate on the router. Keep their mangle jump even when
 	# the user selected lan_only scope; otherwise ping/curl could escape via
@@ -915,9 +955,11 @@ data_plane_present() {
 	# state on every health-check interval.
 	ipset list "$SET4" >/dev/null 2>&1 || return 1
 	ipset list "$GEO4" >/dev/null 2>&1 || return 1
+	[ "$ACCEL_LEARNING_ENABLED" -eq 0 ] || ipset list "$ACCEL_HOT4" >/dev/null 2>&1 || return 1
 	if [ "$IPV6" -eq 1 ]; then
 		ipset list "$SET6" >/dev/null 2>&1 || return 1
 		ipset list "$GEO6" >/dev/null 2>&1 || return 1
+		[ "$ACCEL_LEARNING_ENABLED" -eq 0 ] || ipset list "$ACCEL_HOT6" >/dev/null 2>&1 || return 1
 	fi
 	rule_present 4 "$PREF_CAMPUS" "$MARK_CAMPUS" "$CAMPUS_TABLE" || return 1
 	rule_present 4 "$PREF_USB" "$MARK_USB" "$USB_TABLE" || return 1
@@ -1019,7 +1061,7 @@ remove_firewall() {
 	fi
 }
 remove_routes() { [ -n "$CAMPUS_TABLE" ] || CAMPUS_TABLE="$(state_get campus_table)"; [ -n "$USB_TABLE" ] || USB_TABLE="$(state_get usb_table)"; [ -n "$BLOCK_TABLE" ] || BLOCK_TABLE="$(state_get block_table)"; remove_pref 4 "$PREF_CAMPUS"; remove_pref 4 "$PREF_USB"; remove_pref 4 "$PREF_BLOCK"; remove_pref 6 "$PREF_CAMPUS"; remove_pref 6 "$PREF_USB"; remove_pref 6 "$PREF_BLOCK"; flush_table "$CAMPUS_TABLE"; flush_table "$USB_TABLE"; flush_table "$BLOCK_TABLE"; }
-remove_sets() { ipset destroy "$SET4" >/dev/null 2>&1; ipset destroy "$SET6" >/dev/null 2>&1; ipset destroy "$GEO4" >/dev/null 2>&1; ipset destroy "$GEO6" >/dev/null 2>&1; }
+remove_sets() { ipset destroy "$SET4" >/dev/null 2>&1; ipset destroy "$SET6" >/dev/null 2>&1; ipset destroy "$GEO4" >/dev/null 2>&1; ipset destroy "$GEO6" >/dev/null 2>&1; ipset destroy "$ACCEL_HOT4" >/dev/null 2>&1; ipset destroy "$ACCEL_HOT6" >/dev/null 2>&1; }
 # The lock is shared by procd reloads, the daemon, cron, and hotplug hooks.
 # Only remove a lock owned by this process.  In particular, an old process
 # must not delete a newer owner's lock after a stale-lock takeover.
@@ -1057,6 +1099,7 @@ write_runtime_state() {
 		printf 'campus_table=%s\nusb_table=%s\nblock_table=%s\nplugin_compat=%s\nusb_missing_action=%s\nusb_missing_fallback=%s\ncampus_failover=%s\ncampus_healthcheck=%s\ncampus_probe_hosts=%s\nipv6=%s\ngeosite_domains=%s\n' "$CAMPUS_TABLE" "$USB_TABLE" "$BLOCK_TABLE" "$PLUGIN_COMPAT" "$USB_MISSING_ACTION" "$USB_MISSING_FALLBACK" "$CAMPUS_FAILOVER" "$CAMPUS_HEALTHCHECK" "$CAMPUS_PROBE_HOSTS" "$IPV6" "$GEO_DOMAINS"
 		printf 'accel_enabled=%s\nbandwidth_cap_mbps=%s\naccel_bandwidth_cap_mbps=%s\naccel_trigger_percent=%s\naccel_release_percent=%s\naccel_min_active_flows=%s\naccel_min_new_flows_per_sec=%s\naccel_trigger_seconds=%s\naccel_release_seconds=%s\naccel_max_usb_share_percent=%s\naccel_step_percent=%s\naccel_sample_interval=%s\n' \
 			"$ACCEL_ENABLED" "$BANDWIDTH_CAP_MBPS" "$BANDWIDTH_CAP_MBPS" "$ACCEL_TRIGGER_PERCENT" "$ACCEL_RELEASE_PERCENT" "$ACCEL_MIN_ACTIVE_FLOWS" "$ACCEL_MIN_NEW_FLOWS_PER_SEC" "$ACCEL_TRIGGER_SECONDS" "$ACCEL_RELEASE_SECONDS" "$ACCEL_MAX_USB_SHARE_PERCENT" "$ACCEL_STEP_PERCENT" "$ACCEL_SAMPLE_INTERVAL"
+		printf 'accel_learning_enabled=%s\naccel_hot_ttl=%s\naccel_hot_max_entries=%s\naccel_hot_trigger_percent=%s\naccel_hot_min_new_flows=%s\n' "$ACCEL_LEARNING_ENABLED" "$ACCEL_HOT_TTL" "$ACCEL_HOT_MAX_ENTRIES" "$ACCEL_HOT_TRIGGER_PERCENT" "$ACCEL_HOT_MIN_NEW_FLOWS"
 		printf 'dataplane_signature=%s\npolicy_signature=%s\nlast_reconcile_action=%s\nfull_rebuilds=%s\npolicy_updates=%s\nhealth_ticks=%s\n' \
 			"$DATA_PLANE_SIGNATURE" "$POLICY_SIGNATURE" "$LAST_RECONCILE_ACTION" "$full" "$policy" "$health"
 	} > "$tmp" && mv -f "$tmp" "$STATE_FILE"
@@ -1097,6 +1140,12 @@ reconcile() {
 			if ! ensure_geo_ipset "$GEO6" 6; then set_error 'failed to create IPv6 GeoSite ipset'; reconcile_error=1; fi
 		else
 			ipset destroy "$GEO6" >/dev/null 2>&1 || true
+		fi
+		if ! ensure_hot_ipset "$ACCEL_HOT4" 4; then set_error 'failed to create IPv4 accelerator hotspot set'; reconcile_error=1; fi
+		if [ "$IPV6" -eq 1 ]; then
+			if ! ensure_hot_ipset "$ACCEL_HOT6" 6; then set_error 'failed to create IPv6 accelerator hotspot set'; reconcile_error=1; fi
+		else
+			ipset destroy "$ACCEL_HOT6" >/dev/null 2>&1 || true
 		fi
 		setup_routes || { set_error 'failed to install policy routes'; release_lock; return 1; }
 		setup_rules || { set_error 'failed to install ip rules'; release_lock; return 1; }
@@ -1175,7 +1224,7 @@ status() {
 	elif [ "$CAMPUS_HEALTH_STATE" = online ]; then
 		CAMPUS_ONLINE=1; CAMPUS_ONLINE_REASON="$(health_get reason)"; [ -n "$CAMPUS_ONLINE_REASON" ] || CAMPUS_ONLINE_REASON=probe_ok
 	fi
-	local err='' updated='never' degraded=1 full_rebuilds=0 policy_updates=0 health_ticks=0 last_action=none accel_state accel_reason accel_active accel_share accel_down accel_up accel_flows accel_new accel_moved accel_moved_bytes
+	local err='' updated='never' degraded=1 full_rebuilds=0 policy_updates=0 health_ticks=0 last_action=none accel_state accel_reason accel_active accel_share accel_down accel_up accel_flows accel_new accel_moved accel_moved_bytes hot_count4 hot_count6 hot_learned hot_last_learn hot_last_reason
 	[ -f "$STATE_DIR/last_error" ] && err="$(cat "$STATE_DIR/last_error" 2>/dev/null)"
 	full_rebuilds="$(stats_get full_rebuilds)"; policy_updates="$(stats_get policy_updates)"; health_ticks="$(stats_get health_ticks)"; last_action="$(stats_get last_action)"
 	case "$full_rebuilds" in ''|*[!0-9]*) full_rebuilds=0 ;; esac
@@ -1192,11 +1241,16 @@ status() {
 	accel_new="$(accel_stat_get new_flows_per_sec)"; case "$accel_new" in ''|*[!0-9]*) accel_new=0 ;; esac
 	accel_moved="$(accel_stat_get moved_flows)"; case "$accel_moved" in ''|*[!0-9]*) accel_moved=0 ;; esac
 	accel_moved_bytes="$(accel_stat_get moved_bytes)"; case "$accel_moved_bytes" in ''|*[!0-9]*) accel_moved_bytes=0 ;; esac
+	hot_count4="$(accel_stat_get hot_count4)"; case "$hot_count4" in ''|*[!0-9]*) hot_count4=0 ;; esac
+	hot_count6="$(accel_stat_get hot_count6)"; case "$hot_count6" in ''|*[!0-9]*) hot_count6=0 ;; esac
+	hot_learned="$(accel_stat_get hot_learned)"; case "$hot_learned" in ''|*[!0-9]*) hot_learned=0 ;; esac
+	hot_last_learn="$(accel_stat_get hot_last_learn)"; [ -n "$hot_last_learn" ] || hot_last_learn=never
+	hot_last_reason="$(accel_stat_get hot_last_reason)"; [ -n "$hot_last_reason" ] || hot_last_reason=none
 	[ -f /etc/campus-route/rules.state ] && updated="$(awk -F= '$1=="updated" {print substr($0,index($0,"=")+1); exit}' /etc/campus-route/rules.state 2>/dev/null)"; [ -f /etc/campus-route/rules.state ] && degraded="$(awk -F= '$1=="degraded" {print $2; exit}' /etc/campus-route/rules.state 2>/dev/null)"
 	local c4=0 c6=0
 	[ -n "$IPT4" ] && c4="$("$IPT4" -t mangle -L "$MANGLE_CHAIN" -v -n 2>/dev/null | awk 'NR>2 {p+=$1; b+=$2} END {printf "%s/%s", p+0, b+0}')"
 	[ "$IPV6" -eq 1 ] && [ -n "$IPT6" ] && c6="$("$IPT6" -t mangle -L "$MANGLE_CHAIN" -v -n 2>/dev/null | awk 'NR>2 {p+=$1; b+=$2} END {printf "%s/%s", p+0, b+0}')"
-	printf '{"enabled":%s,"campus_iface":"%s","campus_dev":"%s","campus_ifindex":"%s","campus_gateway":"%s","campus_gateway6":"%s","campus_online":%s,"campus_online_reason":"%s","campus_health_state":"%s","campus_health_failures":%s,"campus_health_successes":%s,"campus_failover":%s,"campus_healthcheck":%s,"campus_probe_hosts":"%s","usb_iface":"%s","usb_dev":"%s","usb_ifindex":"%s","usb_gateway":"%s","usb_gateway6":"%s","usb_online":%s,"usb_online4":%s,"usb_online6":%s,"usb_online_reason":"%s","usb_missing_action":"%s","usb_missing_fallback":%s,"plugin_compat":%s,"ipv6":%s,"unknown_policy":"%s","domestic_precedence":%s,"geosite_domains":%s,"campus_table":"%s","usb_table":"%s","block_table":"%s","rules_updated":"%s","rules_degraded":%s,"ipv4_counters":"%s","ipv6_counters":"%s","reconcile_last_action":"%s","reconcile_full_rebuilds":%s,"reconcile_policy_updates":%s,"reconcile_health_ticks":%s,"accel_enabled":%s,"bandwidth_cap_mbps":%s,"accel_state":"%s","accel_reason":"%s","accel_active":%s,"accel_share_percent":%s,"accel_campus_down_mbps":%s,"accel_campus_up_mbps":%s,"accel_active_flows":%s,"accel_new_flows_per_sec":%s,"accel_moved_flows":%s,"accel_moved_bytes":%s,"last_error":"%s"}\n' "$ENABLED" "$CAMPUS_IFACE" "$CAMPUS_DEV" "$CAMPUS_IFINDEX" "$CAMPUS_GW" "$CAMPUS_GW6" "$CAMPUS_ONLINE" "$CAMPUS_ONLINE_REASON" "$CAMPUS_HEALTH_STATE" "$CAMPUS_HEALTH_FAILURES" "$CAMPUS_HEALTH_SUCCESSES" "$CAMPUS_FAILOVER" "$CAMPUS_HEALTHCHECK" "$CAMPUS_PROBE_HOSTS" "$USB_LOGICAL" "$USB_DEV" "$USB_IFINDEX" "$USB_GW" "$USB_GW6" "$USB_ONLINE" "$USB_ONLINE4" "$USB_ONLINE6" "$USB_ONLINE_REASON" "$USB_MISSING_ACTION" "$USB_MISSING_FALLBACK" "$PLUGIN_COMPAT" "$IPV6" "$UNKNOWN_POLICY" "$DOMESTIC_PRECEDENCE" "$GEO_DOMAINS" "$(state_get campus_table)" "$(state_get usb_table)" "$(state_get block_table)" "$updated" "$degraded" "$c4" "$c6" "$last_action" "$full_rebuilds" "$policy_updates" "$health_ticks" "$ACCEL_ENABLED" "$BANDWIDTH_CAP_MBPS" "$accel_state" "$accel_reason" "$accel_active" "$accel_share" "$accel_down" "$accel_up" "$accel_flows" "$accel_new" "$accel_moved" "$accel_moved_bytes" "$(printf '%s' "$err" | sed 's/"/\\"/g')"
+	printf '{"enabled":%s,"campus_iface":"%s","campus_dev":"%s","campus_ifindex":"%s","campus_gateway":"%s","campus_gateway6":"%s","campus_online":%s,"campus_online_reason":"%s","campus_health_state":"%s","campus_health_failures":%s,"campus_health_successes":%s,"campus_failover":%s,"campus_healthcheck":%s,"campus_probe_hosts":"%s","usb_iface":"%s","usb_dev":"%s","usb_ifindex":"%s","usb_gateway":"%s","usb_gateway6":"%s","usb_online":%s,"usb_online4":%s,"usb_online6":%s,"usb_online_reason":"%s","usb_missing_action":"%s","usb_missing_fallback":%s,"plugin_compat":%s,"ipv6":%s,"unknown_policy":"%s","domestic_precedence":%s,"geosite_domains":%s,"campus_table":"%s","usb_table":"%s","block_table":"%s","rules_updated":"%s","rules_degraded":%s,"ipv4_counters":"%s","ipv6_counters":"%s","reconcile_last_action":"%s","reconcile_full_rebuilds":%s,"reconcile_policy_updates":%s,"reconcile_health_ticks":%s,"accel_enabled":%s,"bandwidth_cap_mbps":%s,"accel_state":"%s","accel_reason":"%s","accel_active":%s,"accel_share_percent":%s,"accel_campus_down_mbps":%s,"accel_campus_up_mbps":%s,"accel_active_flows":%s,"accel_new_flows_per_sec":%s,"accel_moved_flows":%s,"accel_moved_bytes":%s,"accel_hot_count4":%s,"accel_hot_count6":%s,"accel_hot_learned":%s,"accel_hot_last_learn":"%s","accel_hot_last_reason":"%s","last_error":"%s"}\n' "$ENABLED" "$CAMPUS_IFACE" "$CAMPUS_DEV" "$CAMPUS_IFINDEX" "$CAMPUS_GW" "$CAMPUS_GW6" "$CAMPUS_ONLINE" "$CAMPUS_ONLINE_REASON" "$CAMPUS_HEALTH_STATE" "$CAMPUS_HEALTH_FAILURES" "$CAMPUS_HEALTH_SUCCESSES" "$CAMPUS_FAILOVER" "$CAMPUS_HEALTHCHECK" "$CAMPUS_PROBE_HOSTS" "$USB_LOGICAL" "$USB_DEV" "$USB_IFINDEX" "$USB_GW" "$USB_GW6" "$USB_ONLINE" "$USB_ONLINE4" "$USB_ONLINE6" "$USB_ONLINE_REASON" "$USB_MISSING_ACTION" "$USB_MISSING_FALLBACK" "$PLUGIN_COMPAT" "$IPV6" "$UNKNOWN_POLICY" "$DOMESTIC_PRECEDENCE" "$GEO_DOMAINS" "$(state_get campus_table)" "$(state_get usb_table)" "$(state_get block_table)" "$updated" "$degraded" "$c4" "$c6" "$last_action" "$full_rebuilds" "$policy_updates" "$health_ticks" "$ACCEL_ENABLED" "$BANDWIDTH_CAP_MBPS" "$accel_state" "$accel_reason" "$accel_active" "$accel_share" "$accel_down" "$accel_up" "$accel_flows" "$accel_new" "$accel_moved" "$accel_moved_bytes" "$hot_count4" "$hot_count6" "$hot_learned" "$hot_last_learn" "$hot_last_reason" "$(printf '%s' "$err" | sed 's/"/\\"/g')"
 }
 daemon_loop() {
 	local last_enabled=unknown

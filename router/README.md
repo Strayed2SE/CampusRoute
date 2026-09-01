@@ -114,6 +114,17 @@ mark/connmark; a private connmark bit identifies selected flows for byte
 accounting. This is connection distribution, not packet bonding, so a TCP or
 QUIC flow remains on its original outlet for its lifetime.
 
+#### Hotspot learning for short bursts
+
+测速常在几秒内突发大量并发连接，可能在固定触发窗口完成前就结束。开启
+`accel_learning_enabled=1`（默认）后，采样器在校园网利用率达到
+`accel_hot_trigger_percent` 且出现足够新连接时，从已标记为校园网的国内
+活动连接中提取目的 IP，写入带 TTL 的 `campus_accel_hot4/6` 集合。后续同一
+目的 IP 的**新建**国内连接会优先按当前加速比例走 USB；已建立连接、带有
+策略 mark/connmark 的连接以及插件接管流量保持原路径。缓存只存于
+`/var/run/campus-route`，默认 900 秒后过期，最多 256 条，不记录 URL、账号
+或密码。LuCI 状态会显示缓存条目、学习次数、最近时间和原因。
+
 Hotplug file etc/hotplug.d/iface/95-campus-route reconciles after ifup and
 ifdown. etc/cron.d/campus-route refreshes lists weekly at 04:17; the installer
 mirrors that line into /etc/crontabs/root without duplicating it.
