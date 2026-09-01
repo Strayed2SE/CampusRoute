@@ -884,9 +884,14 @@ setup_accel_stats_family() {
 	fi
 	# Count only campus-marked traffic after the exclusions above.  RETURN keeps
 	# these chains observational: no packet is accepted, dropped, or rerouted.
-	[ -n "$CAMPUS_DEV" ] && "$cmd" -t mangle -A "$ACCEL_DOWN_CHAIN" -i "$CAMPUS_DEV" -m mark --mark "$MARK_CAMPUS/$MASK" -m mark --mark "$MARK_CAMPUS" -j RETURN >/dev/null 2>&1
-	[ -n "$CAMPUS_LAN_DEV" ] && "$cmd" -t mangle -A "$ACCEL_UP_CHAIN" -i "$CAMPUS_LAN_DEV" -m mark --mark "$MARK_CAMPUS/$MASK" -m mark --mark "$MARK_CAMPUS" -j RETURN >/dev/null 2>&1
-	"$cmd" -t mangle -A "$ACCEL_LOCAL_CHAIN" -m mark --mark "$MARK_CAMPUS/$MASK" -m mark --mark "$MARK_CAMPUS" -j RETURN >/dev/null 2>&1
+	# Connmark survives both directions of a flow and is available even when a
+	# plugin or an earlier hook did not restore the packet mark yet.
+	# Download bytes are measured at the physical campus ingress.  At this
+	# hook the return packet can precede connmark restoration on some QWRT
+	# builds, so relying on connmark here would under-report a saturated link.
+	[ -n "$CAMPUS_DEV" ] && "$cmd" -t mangle -A "$ACCEL_DOWN_CHAIN" -i "$CAMPUS_DEV" -j RETURN >/dev/null 2>&1
+	[ -n "$CAMPUS_LAN_DEV" ] && "$cmd" -t mangle -A "$ACCEL_UP_CHAIN" -i "$CAMPUS_LAN_DEV" -m connmark --mark "$MARK_CAMPUS/$MASK" -j RETURN >/dev/null 2>&1
+	"$cmd" -t mangle -A "$ACCEL_LOCAL_CHAIN" -m connmark --mark "$MARK_CAMPUS/$MASK" -j RETURN >/dev/null 2>&1
 	"$cmd" -t mangle -N "$ACCEL_MOVED_CHAIN" >/dev/null 2>&1; "$cmd" -t mangle -F "$ACCEL_MOVED_CHAIN" >/dev/null 2>&1
 	# The private flow flag is set only by ACCEL_SELECT_CHAIN, allowing both
 	# directions of an accelerated connection to be counted without mistaking

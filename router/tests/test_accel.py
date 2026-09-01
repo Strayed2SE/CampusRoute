@@ -92,9 +92,13 @@ assert selector_create < domestic_mark
 # IPv4 and IPv6 statistics are collected independently; local OUTPUT upload is
 # included and the accelerator daemon invokes only a fixed reconcile command.
 assert 'counter_bytes "$IPT6" "$MOVED_CHAIN"' in ACCEL
+assert '-m connmark --mark "$MARK_CAMPUS/$MASK"' in MAIN
 assert 'last_rule_bytes "$IPT6" "$LOCAL_CHAIN"' in ACCEL
-assert 'last_rule_bytes "$IPT4" "$LOCAL_CHAIN"' in ACCEL
+assert 'accel_iface_bytes "$CAMPUS_DEV" rx' in ACCEL
+assert 'accel_iface_bytes "$CAMPUS_DEV" tx' in ACCEL
+assert 'accel_iface_bytes()' in ACCEL
 assert '/usr/bin/campus-route reconcile' in ACCEL
+assert 'case "$v" in *legacy*) IPT4=' in ACCEL
 
 print("test_accel: PASS")
 

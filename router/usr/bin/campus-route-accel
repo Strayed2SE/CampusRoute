@@ -36,6 +36,7 @@ resolve_dev() {
 	[ -e "/sys/class/net/$dev" ] && printf '%s\n' "$dev"
 }
 route_ok() { local dev="$1" af="${2:-4}"; [ -n "$dev" ] && ip -"$af" route show default dev "$dev" 2>/dev/null | grep -q .; }
+accel_iface_bytes() { local dev="$1" direction="$2"; [ -n "$dev" ] || { printf '0\n'; return; }; cat "/sys/class/net/$dev/statistics/${direction}_bytes" 2>/dev/null || printf '0\n'; }
 resolve_usb_dev() {
 	local primary fallback dev
 	primary="$(cfg usb_iface_primary)"; [ -n "$primary" ] || primary=wanusb
@@ -89,6 +90,13 @@ sample() {
 	USB_IFACE="$(cfg usb_iface_primary)"; [ -n "$USB_IFACE" ] || USB_IFACE=wanusb
 	CAMPUS_DEV="$(resolve_dev "$CAMPUS_IFACE")"; USB_DEV_CANDIDATE=""; USB_DEV="$(resolve_usb_dev)"
 	IPT4="$(command -v iptables-legacy 2>/dev/null)"; IPT6="$(command -v ip6tables-legacy 2>/dev/null)"
+	# QWRT may expose the legacy backend as plain iptables only.
+	if [ -z "$IPT4" ] && command -v iptables >/dev/null 2>&1; then
+		v="$(iptables --version 2>/dev/null)"; case "$v" in *legacy*) IPT4="$(command -v iptables)" ;; esac
+	fi
+	if [ -z "$IPT6" ] && command -v ip6tables >/dev/null 2>&1; then
+		v6="$(ip6tables --version 2>/dev/null)"; case "$v6" in *legacy*) IPT6="$(command -v ip6tables)" ;; esac
+	fi
 	ACTIVE="$(state_get active)"; case "$ACTIVE" in 1) ;; *) ACTIVE=0 ;; esac
 	SHARE="$(state_get share_percent)"; case "$SHARE" in ''|*[!0-9]*) SHARE=0 ;; esac
 	HIGH_SECONDS="$(state_get high_seconds)"; case "$HIGH_SECONDS" in ''|*[!0-9]*) HIGH_SECONDS=0 ;; esac
@@ -117,7 +125,10 @@ sample() {
 	USB_ONLINE=0; [ "$USB_ONLINE4" -eq 1 ] || [ "$USB_ONLINE6" -eq 1 ] && USB_ONLINE=1
 	if [ "$CAMPUS_ONLINE" -ne 1 ] || [ "$USB_ONLINE" -ne 1 ]; then ACTIVE=0; SHARE=0; STATE=degraded; REASON=link_unavailable; HIGH_SECONDS=0; LOW_SECONDS=0; NOW="$(date +%s)"; DOWN=0; UP=0; NEW=0; DOWN_MBPS=0; UP_MBPS=0; FLOWS=0; NEW_RATE=0; MOVED_FLOWS="$(stat_get moved_flows)"; MOVED_BYTES="$(stat_get moved_bytes)"; MOVED_COUNTER=0; SELECTED=0; case "$MOVED_FLOWS" in ''|*[!0-9]*) MOVED_FLOWS=0 ;; esac; case "$MOVED_BYTES" in ''|*[!0-9]*) MOVED_BYTES=0 ;; esac; write_state; write_stats; reconcile_if_changed; return 0; fi
 	NOW="$(date +%s 2>/dev/null || printf '0')"; PREV="$(stat_get sample_epoch)"; PREV_DOWN="$(stat_get campus_down_bytes)"; PREV_UP="$(stat_get campus_up_bytes)"; PREV_NEW="$(stat_get new_counter)"
-	DOWN="$(last_rule_bytes "$IPT4" "$DOWN_CHAIN")"; UP="$(last_rule_bytes "$IPT4" "$UP_CHAIN")"; LOCAL_UP="$(last_rule_bytes "$IPT4" "$LOCAL_CHAIN")"; UP=$((UP + LOCAL_UP)); NEW="$(counter_packets "$IPT4" "$NEW_CHAIN")"; SELECTED="$(first_rule_packets "$IPT4" "$SELECTED_CHAIN")"; MOVED_COUNTER="$(counter_bytes "$IPT4" "$MOVED_CHAIN")"
+	# QWRT hardware/flow offload can bypass mangle counters even though packets
+	# still traverse the physical uplink.  Use the campus device byte counters
+	# for saturation detection; firewall counters remain for moved-flow stats.
+	DOWN="$(accel_iface_bytes "$CAMPUS_DEV" rx)"; UP="$(accel_iface_bytes "$CAMPUS_DEV" tx)"; NEW="$(counter_packets "$IPT4" "$NEW_CHAIN")"; SELECTED="$(first_rule_packets "$IPT4" "$SELECTED_CHAIN")"; MOVED_COUNTER="$(counter_bytes "$IPT4" "$MOVED_CHAIN")"
 	IPV6="$(cfg_bool ipv6)"; [ "$IPV6" = 1 ] 2>/dev/null && { DOWN=$((DOWN + $(last_rule_bytes "$IPT6" "$DOWN_CHAIN"))); UP=$((UP + $(last_rule_bytes "$IPT6" "$UP_CHAIN"))); UP=$((UP + $(last_rule_bytes "$IPT6" "$LOCAL_CHAIN"))); NEW=$((NEW + $(counter_packets "$IPT6" "$NEW_CHAIN"))); SELECTED=$((SELECTED + $(first_rule_packets "$IPT6" "$SELECTED_CHAIN"))); MOVED_COUNTER=$((MOVED_COUNTER + $(counter_bytes "$IPT6" "$MOVED_CHAIN"))); }
 	case "$PREV" in ''|*[!0-9]*) PREV="$NOW" ;; esac; case "$PREV_DOWN" in ''|*[!0-9]*) PREV_DOWN="$DOWN" ;; esac; case "$PREV_UP" in ''|*[!0-9]*) PREV_UP="$UP" ;; esac; case "$PREV_NEW" in ''|*[!0-9]*) PREV_NEW="$NEW" ;; esac
 	ELAPSED=$((NOW - PREV)); [ "$ELAPSED" -gt 0 ] || ELAPSED=1; [ "$DOWN" -ge "$PREV_DOWN" ] 2>/dev/null || PREV_DOWN="$DOWN"; [ "$UP" -ge "$PREV_UP" ] 2>/dev/null || PREV_UP="$UP"; [ "$NEW" -ge "$PREV_NEW" ] 2>/dev/null || PREV_NEW="$NEW"
