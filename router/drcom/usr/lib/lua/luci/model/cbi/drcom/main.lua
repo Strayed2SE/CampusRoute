@@ -36,6 +36,15 @@ o = s:option(Value, "login_path", translate("登录路径"))
 o.default = "/drcom/login"
 o.rmempty = false
 
+o = s:option(ListValue, "operator", translate("运营商"), translate("免费校园网和四大运营商使用不同门户模板；中国广电已按 R3=4、R6=0、terminal_type=1、v=6780 适配。移动/联通/电信保留可编辑协议参数。"))
+o:value("free", translate("免费校园网"))
+o:value("china_mobile", translate("中国移动"))
+o:value("china_unicom", translate("中国联通"))
+o:value("china_telecom", translate("中国电信"))
+o:value("china_broadnet", translate("中国广电"))
+o.default = "free"
+o.rmempty = false
+
 o = s:option(Value, "status_path", translate("状态路径"))
 o.default = "/drcom/chkstatus"
 o.rmempty = false
@@ -46,6 +55,10 @@ o.rmempty = false
 o = s:option(Value, "password", translate("上网密码"))
 o.password = true
 o.rmempty = false
+
+o = s:option(Value, "user_suffix", translate("账号后缀"), translate("部分校园网要求在账号后追加运营商标识；默认留空，不自动猜测。"))
+o.placeholder = "例如：@telecom"
+o.rmempty = true
 
 o = s:option(Value, "interval", translate("检测间隔（秒）"))
 o.datatype = "and(uinteger,min(15),max(3600))"

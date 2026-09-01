@@ -19,6 +19,14 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def payload(path: Path) -> bytes:
+    """Store text artifacts with Unix LF regardless of the checkout setting."""
+    data = path.read_bytes()
+    if path.suffix in {"", ".sh", ".lua", ".py", ".ps1", ".json", ".md", ".txt", ".uci"} or path.name in {"campus-route", "campus-route-accel", "campus-route-update", "campus-route-rollback"}:
+        return data.replace(b"\r\n", b"\n")
+    return data
+
+
 def ignored(path: Path) -> bool:
     rel = path.relative_to(ROOT)
     return bool({".git", "build", "dist", "outputs", "work", "artifacts"} & set(rel.parts)) or "__pycache__" in rel.parts or path.suffix in {".pyc", ".pyo"}
@@ -36,7 +44,7 @@ def zip_tree(path: Path, output: Path, prefix: str = "") -> None:
             info = zipfile.ZipInfo(name, STAMP)
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = (0o100755 if file.suffix in {".sh", ".lua"} or file.name in {"campus-route", "campus-route-accel", "campus-route-update", "campus-route-rollback"} else 0o100644) << 16
-            archive.writestr(info, file.read_bytes())
+            archive.writestr(info, payload(file))
 
 
 def tar_tree(path: Path, output: Path, root_name: str) -> None:
@@ -58,7 +66,7 @@ def tar_tree(path: Path, output: Path, root_name: str) -> None:
                         info.mode = 0o755
                         info.size = 0
                     else:
-                        data = file.read_bytes()
+                        data = payload(file)
                         info.mode = 0o600 if rel == "etc/config/campus_route" else (0o755 if file.suffix in {".sh", ".lua"} or file.name in {"campus-route", "campus-route-accel", "campus-route-update", "campus-route-rollback"} else 0o644)
                         info.size = len(data)
                         info.type = tarfile.REGTYPE

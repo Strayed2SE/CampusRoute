@@ -27,6 +27,14 @@ for rel in $FILES; do
 	mkdir -p "$ROOT/$(dirname -- "$rel")" || exit 1
 	cp -f "$SELF_DIR/$rel" "$ROOT/$rel" || exit 1
 done
+DRCOM_FILES="etc/config/drcom etc/init.d/drcom-auto-login etc/hotplug.d/iface/96-drcom-auto-login usr/bin/drcom-auto-login usr/lib/lua/luci/controller/drcom.lua usr/lib/lua/luci/model/cbi/drcom/main.lua usr/share/rpcd/acl.d/luci-app-drcom.json"
+for rel in $DRCOM_FILES; do
+	if [ "$DRY" -eq 1 ]; then printf 'copy drcom/%s -> %s\n' "$rel" "$ROOT/$rel"; continue; fi
+	# Preserve an existing local Dr.COM configuration, including credentials.
+	if [ "$rel" = "etc/config/drcom" ] && [ -f "$ROOT/$rel" ]; then continue; fi
+	mkdir -p "$ROOT/$(dirname -- "$rel")" || exit 1
+	cp -f "$SELF_DIR/drcom/$rel" "$ROOT/$rel" || exit 1
+done
 if [ "$DRY" -eq 0 ]; then
 	mkdir -p "$ROOT/etc/campus-route/rules" "$ROOT/etc/campus-route/snapshots" || exit 1
 	for rel in cn4.txt cn6.txt geosite-cn.txt; do
@@ -34,6 +42,8 @@ if [ "$DRY" -eq 0 ]; then
 	done
 	chmod 0600 "$ROOT/etc/config/campus_route" 2>/dev/null || true
 	chmod 0755 "$ROOT/etc/init.d/campus-route" "$ROOT/etc/hotplug.d/iface/95-campus-route" "$ROOT/etc/hotplug.d/net/95-campus-usb" "$ROOT/snapshot.sh" "$ROOT/rollback.sh" "$ROOT/usr/bin/campus-route" "$ROOT/usr/bin/campus-route-accel" "$ROOT/usr/bin/campus-route-update" "$ROOT/usr/bin/campus-route-rollback"
+	chmod 0755 "$ROOT/etc/init.d/drcom-auto-login" "$ROOT/etc/hotplug.d/iface/96-drcom-auto-login" "$ROOT/usr/bin/drcom-auto-login"
+	chmod 0600 "$ROOT/etc/config/drcom" 2>/dev/null || true
 	CRON="$ROOT/etc/crontabs/root"; mkdir -p "$(dirname -- "$CRON")"
 	if [ ! -f "$CRON" ] || ! grep -q '/usr/bin/campus-route refresh' "$CRON" 2>/dev/null; then printf '%s\n' '17 4 * * 0 uci -q get campus_route.main.rule_refresh 2>/dev/null | grep -qx weekly && /usr/bin/campus-route refresh >/dev/null 2>&1' >> "$CRON"; fi
 	if [ ! -f "$CRON" ] || ! grep -q '/usr/bin/campus-route reconcile' "$CRON" 2>/dev/null; then printf '%s\n' '* * * * * uci -q get campus_route.main.enabled 2>/dev/null | grep -qx 1 && /usr/bin/campus-route reconcile >/dev/null 2>&1' >> "$CRON"; fi
